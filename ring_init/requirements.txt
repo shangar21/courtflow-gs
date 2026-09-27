@@ -1,0 +1,10 @@
+# Verified upstream package names; install PyTorch appropriate to CUDA before these.
+gsplat
+open3d
+numpy
+opencv-python
+scipy
+plyfile
+pytest
+# Install MASt3R recursively from https://github.com/naver/mast3r (mast3r + dust3r imports).
+# Install SAM2 from https://github.com/facebookresearch/sam2 with Python >=3.10 and torch >=2.5.1.

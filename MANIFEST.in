@@ -1,0 +1,3 @@
+recursive-include ring_init/configs *.json
+recursive-include ring_init/deform/csrc *.cu
+recursive-include ring_init/gs/csrc/fused_ssim *

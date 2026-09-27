@@ -1,0 +1,66 @@
+"""One-command canonical reconstruction, dynamic tracking, evaluation, and final renders.
+
+The input config contains machine-specific paths for videos, calibration, SAM2, and held-out
+evaluation data.  ``--train-dir`` replaces its ``data_root``, making the dataset directory the
+only required data argument for each training run.
+
+Example:
+
+    python -m ring_init.e2e --scene basketball --train-dir /datasets/ring_init_data \
+      --config ring_init/configs/basketball.local.json --out-dir /outputs/ring_final
+"""
+from __future__ import annotations
+import argparse
+import subprocess
+import sys
+from pathlib import Path
+
+from ring_init.config import Config
+from ring_init.run import stage_a, stage_b
+
+
+def _render(cfg_path: Path, scene: str, tag: str, checkpoint: int, camera: str, frames: str, out: Path) -> None:
+    out.parent.mkdir(parents=True, exist_ok=True)
+    command = [sys.executable, "-m", "ring_init.render_baked", "--scene", scene, "--config", str(cfg_path),
+               "--tag", tag, "--checkpoint", str(checkpoint), "--camera", camera, "--frames", frames,
+               "--fps", "25", "--scale", "0.5", "--out", str(out)]
+    subprocess.run(command, check=True)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--scene", required=True)
+    ap.add_argument("--train-dir", required=True, help="directory containing <scene>/ training images")
+    ap.add_argument("--config", required=True, help="local JSON with camera/video/SAM2/evaluation paths")
+    ap.add_argument("--out-dir", help="output root (default: <train-dir>/ring_dynamic_outputs)")
+    ap.add_argument("--frames", default="0:300", help="Stage-B frame range")
+    ap.add_argument("--force", default="", help="comma-separated Stage-A/B cache steps to recompute")
+    ap.add_argument("--eval-view", type=int, default=13, help="held-out camera for final playback")
+    ap.add_argument("--orbit-frames", type=int, default=900, help="slow-orbit output length at 25 FPS")
+    args = ap.parse_args()
+
+    cfg = Config.load(args.config)
+    cfg.data_root = str(Path(args.train_dir).resolve())
+    cfg.out_root = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.train_dir).resolve() / "ring_dynamic_outputs")
+    cfg.stage_b_mode = "scene"  # final QuickCapture-style MLS method; legacy v1 is never selected here.
+    force = {x for x in args.force.split(",") if x}
+
+    # Persist the exact resolved run configuration with outputs, then use it for render commands.
+    run_root = Path(cfg.out_root) / args.scene
+    run_root.mkdir(parents=True, exist_ok=True)
+    resolved = run_root / "e2e_config.json"; cfg.save(resolved)
+    stage_a(args.scene, cfg, force, None, True)
+    stage_b(args.scene, cfg, args.frames, force)
+
+    _, _, end_s = args.frames.partition(":"); final_frame = int(end_s) - 1
+    tag = "stage_b_v2"  # ring_init.run's production scene tracker output.
+    render_dir = run_root / tag / "final_renders"
+    _render(resolved, args.scene, tag, final_frame, f"view:{args.eval_view}", args.frames,
+            render_dir / f"final_eval_view{args.eval_view:02d}.mp4")
+    _render(resolved, args.scene, tag, final_frame, "orbit", f"0:{args.orbit_frames}",
+            render_dir / "final_slow_orbit.mp4")
+    print(f"E2E run complete. Outputs: {run_root}")
+
+
+if __name__ == "__main__":
+    main()

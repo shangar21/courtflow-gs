@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ring-dynamic-gaussians"
+version = "0.1.0"
+description = "Multi-view dynamic Gaussian reconstruction with MLS control-point tracking"
+requires-python = ">=3.10"
+readme = "README.md"
+
+[tool.setuptools.packages.find]
+include = ["ring_init*"]
+
+[tool.setuptools.package-data]
+ring_init = ["configs/*.json", "deform/csrc/*.cu", "gs/csrc/fused_ssim/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["ring_init/tests"]

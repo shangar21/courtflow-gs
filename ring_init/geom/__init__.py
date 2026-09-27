@@ -1,0 +1,1 @@
+"""Known-pose geometry operations."""

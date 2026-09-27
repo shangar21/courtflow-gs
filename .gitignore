@@ -1,0 +1,26 @@
+# Data, trained models, and generated media are external to the source release.
+cameras/
+artifacts/
+calibration/
+data/
+docs/
+old_experiments/
+scripts/
+tools/
+third_party/
+plan.md
+DepthCamera_*.json
+DepthCapture_*.png
+Reconstruction Take Home Assignment.pdf
+out/
+outputs/
+*.pyc
+__pycache__/
+.pytest_cache/
+ring_init/**/build/
+.DS_Store
+
+# Local configuration may contain machine-specific paths and checkpoints.
+ring_init/configs/*.local.json
+ring_init/configs/basketball.json
+ring_init/configs/basketball_sam2_tiny.json
