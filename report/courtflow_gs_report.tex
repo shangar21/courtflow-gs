@@ -1,6 +1,6 @@
 \documentclass[11pt]{article}
 \usepackage[margin=0.9in]{geometry}
-\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref}
+\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref,algorithm,algpseudocode}
 \usepackage{mathptmx} % Times New Roman-compatible text and mathematics
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
 \newcommand{\method}{\textsc{CourtFlow-GS}}
@@ -64,23 +64,31 @@ Every tenth frame receives 500 full-image iterations with bounded densification 
 Gaussian-control rebind. The model state is baked forward after each frame.
 
 \subsection{Pseudocode}
-\begin{verbatim}
-state, controls = build_canonical_scene(frame0, fixed_calibration)
-for frame in sequence:
-    images = decode_undistort_normalize(training_videos, frame)
-    if frame % 5 == 0:
-        masks = SAM2_reprompt(images, project(state.dynamic))
-        anchors = triangulate(mask_centroids(masks))
-    offsets = optimize(group_translation + local_control_offsets,
-                       L1_DSSIM + mask_BCE + ARAP + temporal + anchors)
-    state = bake(fused_rigid_MLS(state, controls, offsets))
-    if frame % 10 != 0:
-        state = refine(dynamic_content_crops(state, images), 100, no_densify)
-    else:
-        state = refine(full_images, 500, bounded_densify)
-        controls = rebind(state, controls); cache_background(state)
-    save_metrics_checkpoint_and_novel_view_render(state)
-\end{verbatim}
+\begin{algorithm}[H]
+\caption{CourtFlow-GS online reconstruction}\label{alg:courtflow}
+\begin{algorithmic}[1]
+\Require Frame-0 images, synchronized training videos, fixed calibration
+\State $(\mathit{state},\mathit{controls}) \gets \Call{BuildCanonicalScene}{\mathit{frame}_0,\mathit{calibration}}$
+\For{each $f$ in the video sequence}
+  \State $\mathit{images} \gets \Call{DecodeUndistortNormalize}{\mathit{trainingVideos}, f}$
+  \If{$f \bmod 5 = 0$}
+    \State $\mathit{masks} \gets \Call{SAM2RePrompt}{\mathit{images},\Call{Project}{\mathit{state.dynamic}}}$
+    \State $\mathit{anchors} \gets \Call{Triangulate}{\Call{MaskCentroids}{\mathit{masks}}}$
+  \Else
+    \State $\mathit{masks},\mathit{anchors} \gets \varnothing,\varnothing$
+  \EndIf
+  \State $\mathit{offsets} \gets \Call{OptimizeControls}{L_1{+}\mathrm{D\text{-}SSIM},\mathit{masks},\mathit{anchors},\mathrm{ARAP},\mathrm{temporal}}$
+  \State $\mathit{state} \gets \Call{Bake}{\Call{FusedRigidMLS}{\mathit{state},\mathit{controls},\mathit{offsets}}}$
+  \If{$f \bmod 10 \ne 0$}
+    \State $\mathit{state} \gets \Call{Refine}{\Call{DynamicContentCrops}{\mathit{state},\mathit{images}},100,\mathit{noDensify}}$
+  \Else
+    \State $\mathit{state} \gets \Call{Refine}{\mathit{images},500,\mathit{boundedDensify}}$
+    \State $\mathit{controls} \gets \Call{Rebind}{\mathit{state},\mathit{controls}}$; \Call{CacheBackground}{\mathit{state}}
+  \EndIf
+  \State \Call{SaveDiagnostics}{\mathit{state}}
+\EndFor
+\end{algorithmic}
+\end{algorithm}
 
 \section{Results}
 \begin{table}[H]\centering
