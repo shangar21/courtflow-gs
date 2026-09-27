@@ -30,18 +30,28 @@ def _render(cfg_path: Path, scene: str, tag: str, checkpoint: int, camera: str, 
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--scene", required=True)
-    ap.add_argument("--train-dir", required=True, help="directory containing <scene>/ training images")
+    source = ap.add_mutually_exclusive_group(required=True)
+    source.add_argument("--train-dir", help="directory containing <scene>/ pre-extracted training images")
+    source.add_argument("--dataset-dir", help="raw capture root containing cameras/ and calibration/")
     ap.add_argument("--config", required=True, help="local JSON with camera/video/SAM2/evaluation paths")
     ap.add_argument("--out-dir", help="output root (default: <train-dir>/ring_dynamic_outputs)")
     ap.add_argument("--frames", default="0:300", help="Stage-B frame range")
     ap.add_argument("--force", default="", help="comma-separated Stage-A/B cache steps to recompute")
     ap.add_argument("--eval-view", type=int, default=13, help="held-out camera for final playback")
     ap.add_argument("--orbit-frames", type=int, default=900, help="slow-orbit output length at 25 FPS")
+    ap.add_argument("--prepare-only", action="store_true", help="validate/bootstrap raw cameras+calibration, then stop before training")
     args = ap.parse_args()
 
     cfg = Config.load(args.config)
-    cfg.data_root = str(Path(args.train_dir).resolve())
-    cfg.out_root = str(Path(args.out_dir).resolve()) if args.out_dir else str(Path(args.train_dir).resolve() / "ring_dynamic_outputs")
+    base = Path(args.dataset_dir or args.train_dir).resolve()
+    cfg.out_root = str(Path(args.out_dir).resolve()) if args.out_dir else str(base / "ring_dynamic_outputs")
+    if args.dataset_dir:
+        from ring_init.bootstrap import prepare
+        prepared = prepare(base, cfg.out_root, args.scene)
+        for key, value in prepared.items(): setattr(cfg, key, value)
+        cfg.calibration = "calibration.json"
+    else:
+        cfg.data_root = str(base)
     cfg.stage_b_mode = "scene"  # final QuickCapture-style MLS method; legacy v1 is never selected here.
     force = {x for x in args.force.split(",") if x}
 
@@ -49,6 +59,9 @@ def main() -> None:
     run_root = Path(cfg.out_root) / args.scene
     run_root.mkdir(parents=True, exist_ok=True)
     resolved = run_root / "e2e_config.json"; cfg.save(resolved)
+    if args.prepare_only:
+        print(f"Capture bootstrap complete. Resolved config: {resolved}")
+        return
     stage_a(args.scene, cfg, force, None, True)
     stage_b(args.scene, cfg, args.frames, force)
 

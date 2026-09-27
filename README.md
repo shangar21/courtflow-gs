@@ -63,13 +63,19 @@ baked PLY checkpoints under `<out_root>/<scene>/stage_b_v2/`.
 Stage A plus the selected Stage B method, evaluates held-out views, and generates a final
 held-out-view video and 36-second slow orbit from the final baked checkpoint.
 
+For a raw capture root containing `cameras/view_000.mp4` … `view_035.mp4` and
+`calibration/cameras.txt` + `images.txt`:
+
 ```bash
-python -m ring_init.e2e --scene basketball --train-dir /datasets/ring_init_data \
-  --config ring_init/configs/basketball.local.json --out-dir /outputs/ring_final
+python -m ring_init.e2e --scene basketball --dataset-dir /datasets/basketball_capture \
+  --config ring_init/configs/config.example.json --out-dir /outputs/ring_final
 ```
 
-The local config still supplies the calibrated videos, SAM2 checkpoint, calibration, and held-out
-evaluation paths.  The command writes its fully resolved configuration to
+The bootstrap adapter derives the 12 training cameras, all-view pinhole calibration, identity
+photometric metadata, and frame-0 evaluation images from that raw layout.  The local config only
+needs SAM2/MASt3R paths for this case.  Use `--prepare-only` to validate this setup without
+training. Copy `ring_init/configs/config.example.json` to a `.local.json` file and set your SAM2
+paths before a real run. The command writes its fully resolved configuration to
 `<out-dir>/<scene>/e2e_config.json` for reproducibility.
 
 ## Baked inference

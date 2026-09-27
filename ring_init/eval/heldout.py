@@ -12,6 +12,15 @@ from ring_init.io.calib import Camera
 
 
 def load_all_cameras(sparse: str | Path) -> dict[int, Camera]:
+    sparse = Path(sparse)
+    if sparse.suffix == ".json":
+        payload = json.loads(sparse.read_text())
+        result = {}
+        for i, value in enumerate(payload["cameras"]):
+            K, R, t = np.asarray(value["K"], np.float64), np.asarray(value["R"], np.float64), np.asarray(value["t"], np.float64)
+            name = value.get("name", f"view_{i:03d}.png"); view = int(Path(name).stem.split("_")[-1])
+            result[view] = Camera(name, K, np.asarray(value.get("distortion", [])), R, t, int(value["width"]), int(value["height"]))
+        return result
     import pycolmap
     rec = pycolmap.Reconstruction(str(sparse)); result = {}
     for im in rec.images.values():

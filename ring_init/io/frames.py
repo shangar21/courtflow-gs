@@ -19,7 +19,7 @@ def _linear_to_srgb(x: np.ndarray) -> np.ndarray:
 
 class ViewPreprocessor:
     def __init__(self, view: int, distorted_cameras_txt: Path, distorted_images_txt: Path, pinhole_sparse: Path, photometric_json: Path):
-        import pycolmap
+        pinhole_sparse = Path(pinhole_sparse)
         name = f"view_{view:03d}.png"
         cam_id = next(int(l.split()[8]) for l in Path(distorted_images_txt).read_text().splitlines()
                       if l and not l.startswith("#") and len(l.split()) >= 10 and l.split()[9] == name)
@@ -27,11 +27,19 @@ class ViewPreprocessor:
         if line[1] != "OPENCV": raise ValueError(f"{name}: expected OPENCV camera model, got {line[1]}")
         self.src_size = (int(line[2]), int(line[3]))
         fx, fy, cx, cy, k1, k2, p1, p2 = map(float, line[4:12])
-        rec = pycolmap.Reconstruction(str(pinhole_sparse)); im = next(i for i in rec.images.values() if i.name == name); c = rec.camera(im.camera_id)
-        P = c.params
+        if pinhole_sparse.suffix == ".json":
+            item = next(x for x in json.loads(pinhole_sparse.read_text())["cameras"] if x.get("name") == name)
+            Kout, out_w, out_h = np.asarray(item["K"], np.float32), int(item["width"]), int(item["height"])
+            # Raw videos are decoded at half resolution by the capture bootstrap.
+            self.src_size = (self.src_size[0] // 2, self.src_size[1] // 2); fx *= .5; fy *= .5; cx *= .5; cy *= .5
+        else:
+            import pycolmap
+            rec = pycolmap.Reconstruction(str(pinhole_sparse)); im = next(i for i in rec.images.values() if i.name == name); c = rec.camera(im.camera_id)
+            P, out_w, out_h = c.params, c.width, c.height
+            Kout = np.array([[P[0], 0, P[2]], [0, P[1], P[3]], [0, 0, 1]], np.float32)
         # COLMAP pixel centres are at +0.5; OpenCV's at 0.
-        Kd = np.array([[fx, 0, cx - .5], [0, fy, cy - .5], [0, 0, 1]]); Ku = np.array([[P[0], 0, P[2] - .5], [0, P[1], P[3] - .5], [0, 0, 1]])
-        self.map1, self.map2 = cv2.initUndistortRectifyMap(Kd, np.array([k1, k2, p1, p2]), None, Ku, (c.width, c.height), cv2.CV_32FC1)
+        Kd = np.array([[fx, 0, cx - .5], [0, fy, cy - .5], [0, 0, 1]]); Ku = Kout.copy(); Ku[:2, 2] -= .5
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(Kd, np.array([k1, k2, p1, p2]), None, Ku, (out_w, out_h), cv2.CV_32FC1)
         photo = json.loads(Path(photometric_json).read_text())["transforms_to_reference"]
         t = next(x for x in photo if x["view"] == view)
         self.gain, self.bias = np.asarray(t["gain"], np.float32), np.asarray(t["bias"], np.float32)
