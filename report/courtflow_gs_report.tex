@@ -26,27 +26,116 @@ The raw-capture adapter accepts \texttt{cameras/view\_XXX.mp4} and
 \texttt{calibration/cameras.txt}, \texttt{images.txt}, producing half-resolution pinhole inputs.
 
 \section{Methodology}
+This section specifies the reported configuration so that the method can be recreated without
+reading the implementation.  Let $P_c=K_c[R_c\mid t_c]$ be a fixed undistorted pinhole camera,
+with world-to-camera convention $x_c=R_cx+t_c$.  Camera poses, intrinsics, and photometric gains
+are never optimized. RGB is divided by 255.  The 12 training cameras are every third camera of the
+36-camera ring; all other cameras are held out. Every input is undistorted before segmentation,
+matching, training, or evaluation.
+
 \subsection{Canonical frame-0 reconstruction}
-Stage A undistorts images, detects people, prompts SAM2 masks, and associates instances through
-3D occupancy carving. For each person, an occlusion-aware visual hull intersects the backprojected
-mask cones. A view does not carve a candidate voxel when a known foreground/static occluder
-explains its missing silhouette. MASt3R runs in person-specific crops; matches are triangulated
-with fixed cameras and rejected for poor reprojection, weak baseline, hull inconsistency, or
-cross-view colour inconsistency. The accepted points initialize separate person Gaussian models
-and a background model.
+\paragraph{Masks and 3D identities.}
+On frame 0, Faster R-CNN detects people (score $\geq0.5$) and SAM2 refines every on-court box;
+masks smaller than 64 pixels are discarded. Identities are established in 3D rather than by
+chaining 2D detections. Fit the court plane with RANSAC on full-frame MASt3R triangulations and,
+when needed, estimate metric scale from a 1.9 m person-height prior. Make a court-aligned grid of
+5 cm voxels, 2.4 m high, with a 1 m horizontal margin. Keep a voxel if it projects into the union
+foreground mask in at least $\max(4,n_{\mathrm{visible}}-2)$ cameras. Form 26-connected components,
+reject components with fewer than 30 voxels, height below 1.2 m, or a bottom implausibly above the
+floor, and split a footprint exceeding 1.1 m into
+$\lceil\mathrm{maximum\ footprint\ extent}/1.1\rceil$ floor-plane k-means clusters. Sort components
+by floor $(u,v)$ to assign deterministic IDs.
+
+Project each component into each camera, splat its projected coarse voxels to a silhouette, and
+Hungarian-match detector masks to those silhouettes. Accept matches only at IoU $\geq0.20$. For an
+unmatched component, re-prompt SAM2 with its projected box and centroid. Accept this recovery only
+if its 16-by-16 HSV histogram has Bhattacharyya distance $\leq0.5$ from the median histogram of
+that component's accepted masks in other views. A failed recovery leaves the camera \emph{unlabelled}
+for that identity---it is not background evidence. Resolve overlapping accepted masks by nearest
+median component depth. This yields mutually exclusive integer labels $L_c$ (0 is background) and
+median label depths $d_{c,k}$.
+
+\paragraph{Occlusion-aware visual hull.}
+For identity $k$, make a 1 cm grid in the coarse-component bounds plus two coarse-voxel margins.
+Camera $c$ gives a candidate voxel $x$ a negative vote only if $x$ is in its frustum, $c$ has an
+accepted label for $k$, $L_c(\pi_c(x))\ne k$, and no nearer reconstructed surface explains the
+absence. The absence is explained if either (i) the pixel belongs to another labelled identity $j$
+with $d_{c,j}<d_{c,k}$, or (ii) a static depth map obeys
+$D_c(\pi_c(x))<z_c(x)-0.30$ m. Build $D_c$ from full-frame MASt3R points labelled background and
+colour-consistent in at least two extra views, keeping nearest depth after a 4-pixel square splat;
+exclude points within 0.5 m of the floor.
+
+Retain $x$ iff it is observed inside $k$'s label in at least two cameras and has zero unexplained
+negative votes; then remove voxels below the floor. Therefore a missing silhouette pixel is not
+forgiven merely because occlusion is possible: it is forgiven only when a measured nearer dynamic
+or static depth demonstrates an occluder. An unlabelled camera casts no vote. This is the precise
+meaning of ``occlusion-aware'' in this method.
+
+\paragraph{Per-instance crop MASt3R points and Gaussian seeds.}
+For every identity and each adjacent/skip-one ring pair $(c,c+1)$ and $(c,c+2)$, use the tight
+label box, enlarge its side by 35\%, enforce a 96-pixel minimum, clip by translation to the image,
+and resize the square crop to $512\times512$. Dilate the source mask by two pixels and query
+MASt3R reciprocal nearest neighbours only at every second source-mask pixel. Map crop coordinates
+back with $u=(u_{512}+0.5)s^{-1}-0.5+x_0$ (and analogously for $v$). Retain a correspondence iff
+confidence is $\geq1.5$, both endpoints lie in their identity masks, both depths are positive,
+maximum reprojection error is below 1.5 pixels, triangulation angle is at least $3^\circ$, and the
+DLT point lies in the one-voxel-dilated hull. It must also be label-consistent and have mean RGB
+$L_1<0.12$ in at least one non-anchor camera.
+
+Those points are accurate surface seeds. Add only surface hull voxels farther than two hull voxels
+from a seed, thereby filling weak texture without duplicating matched surfaces. Assign each point
+the median colour across label-consistent self-z-buffer-visible views, remove statistical outliers
+(20 neighbours, 2 standard deviations), and fuse at 5 mm for people. Background uses full-frame
+matches outside person hulls dilated by 10 cm and the same colour test, fused at 10 cm. Initialize
+one normal-oriented, anisotropic degree-1-SH Gaussian per fused point with opacity 0.5, a
+third-neighbour scale, and normal-axis scale 0.1 times tangent scale. Persons train for 7000
+iterations (four cameras/step) and background for 10000 (two cameras/step), using
+\[
+\mathcal L_{\rm image}=\|I-\hat I\|_1+0.2\,\mathrm{D\mbox{-}SSIM}
++0.1\mathcal L_{\rm alpha}+0.05\mathcal L_{\rm depth}.
+\]
+Depth weight decays to zero halfway through training. Densification starts at iteration 500 and
+runs every 100 iterations until halfway; prune opacity below 0.01 and splats outside a
+3-pixel-dilated mask in two views.
 
 \subsection{Group-aware control-point MLS}
-Each Gaussian is bound to its $K=8$ nearest controls from the \emph{same} group. Its fixed radial
-basis weights are
+Every dynamic Gaussian belongs to exactly one person (the ball, when enabled, is a separate
+group); background is group 0. Farthest-point sample 1024 controls per person, 16 for the ball,
+and 1000 for background. Each Gaussian is bound once to its $K=8$ nearest controls from the
+\emph{same} group. Its fixed radial-basis weights are
 \[
-w_i(g)=\frac{\exp(-\|x_g-c_i\|^2/2\sigma^2)}{\sum_{j=1}^{K}\exp(-\|x_g-c_j\|^2/2\sigma^2)}.
+w_{ij}=\frac{\exp(-\|x_i-p_j\|^2/(2\sigma_j^2))}
+{\sum_{\ell=1}^{8}\exp(-\|x_i-p_\ell\|^2/(2\sigma_\ell^2))},
 \]
-Thus player splats cannot be pulled by other players or background controls. At each frame the
-optimizer estimates one shared translation per movable group plus local control offsets. A fused
-CUDA rigid-MLS kernel transforms Gaussian means, orientations, and degree-1 SH coefficients.
-The loss combines $L_1+$D-SSIM, per-instance mask BCE, ARAP using local MLS rotations, temporal
-acceleration, and triangulated mask-centroid anchors. Dynamic-only deformation freezes the
-background controls between keyframes and composites dynamic splats over a cached background.
+where $\sigma_j$ is the mean distance from control $j$ to its three nearest controls. The six
+nearest same-group controls form the ARAP graph. Thus a player's splats cannot be moved by any
+other player or by background controls.
+
+At frame $f$, warm-start control offsets from the previous control velocity. Optimize a shared
+translation $T_k$ per movable group and local control offsets $\delta_j$ for 50 Adam iterations,
+using four cameras/iteration and learning rates 0.020 m and 0.003 m respectively. Let
+$t_j=T_{g(j)}+\delta_j$, $p'_j=p_j+t_j$, and retain the fixed weights above. For Gaussian $i$,
+\[
+ \bar p_i=\sum_jw_{ij}p_j,\quad \bar q_i=\sum_jw_{ij}p'_j,\quad
+ M_i=\sum_jw_{ij}(p_j-\bar p_i)(p'_j-\bar q_i)^T.
+\]
+With $M_i=USV^T$, set $R_i=VU^T$, flipping the last column of $V$ if $\det(VU^T)<0$. The baked
+position is $x'_i=R_i(x_i-\bar p_i)+\bar q_i$; orientation and degree-1 SH are also rotated by
+$R_i$. The fused CUDA operation evaluates this transform and its backward pass. The reported run
+does not blend separately optimized control rotations.
+
+Every fifth frame, render per-instance weights, prompt SAM2 with each rendered box and centroid,
+and resolve overlap by highest rendered instance weight. Triangulate each mask centroid by
+area-square-root-weighted least-squares ray intersection. Use the resulting displacement to
+initialize $T_k$, and apply a Huber anchor of scale 0.3 m and weight 0.1 when enough views observe
+the identity. On intervening frames, no mask or anchor is fabricated. The deformation objective is
+\[
+\mathcal L=\mathcal L_{\rm image}+0.3\mathcal L_{\rm BCE}^{\rm instance}
++\mathcal L_{\rm ARAP}+0.01\mathcal L_{\rm accel}+\mathcal L_{\rm anchor},
+\]
+where ARAP averages $\|(p'_a-p'_b)-R_a(p_a-p_b)\|^2/\|p_a-p_b\|^2$ over graph edges and
+acceleration is normalized second-order control displacement. During deformation, background
+controls are frozen and the dynamic raster is depth-composited over a cached background.
 
 \begin{figure}[H]
 \centering
@@ -58,34 +147,39 @@ $\rightarrow$ focused refinement and periodic keyframe.}}
 \end{figure}
 
 \subsection{Focused refinement}
-After every non-keyframe deformation, dynamic Gaussians are projected into every camera. Their
-padded, tile-aligned union crop is refined for 100 Gaussian iterations without densification.
-Every tenth frame receives 500 full-image iterations with bounded densification and a
-Gaussian-control rebind. The model state is baked forward after each frame.
+Bake Gaussian and control state forward after every deformation. At a non-keyframe, project all
+dynamic Gaussians into every training camera, form their union box with 48 pixels of padding,
+snap it outward to the 16-pixel gsplat tile grid, shift the principal point by the crop origin, and
+run 100 refinement iterations on two crops/step. Tile alignment makes crop rasterization
+pixel-identical to the corresponding full render. This phase has no densification or pruning, so
+control bindings remain stable. Every tenth frame instead runs 500 full-image iterations, permits
+densification from iteration 50 every 50 steps until 60\% of the schedule, caps growth at 5\% per
+keyframe, rebinds each Gaussian to eight nearest same-group controls, and refreshes the background
+cache. Held-out cameras are never used in a loss.
 
 \subsection{Pseudocode}
 \begin{algorithm}[H]
 \caption{CourtFlow-GS online reconstruction}\label{alg:courtflow}
 \begin{algorithmic}[1]
 \Require Frame-0 images, synchronized training videos, fixed calibration
-\State $(\mathit{state},\mathit{controls}) \gets \Call{BuildCanonicalScene}{\mathit{frame}_0,\mathit{calibration}}$
+\State $(\mathit{state},\mathit{controls}) \gets \textsc{BuildCanonicalScene}(\mathit{frame}_0,\mathit{calibration})$
 \For{each $f$ in the video sequence}
-  \State $\mathit{images} \gets \Call{DecodeUndistortNormalize}{\mathit{trainingVideos}, f}$
+  \State $\mathit{images} \gets \textsc{DecodeUndistortNormalize}(\mathit{trainingVideos},f)$
   \If{$f \bmod 5 = 0$}
-    \State $\mathit{masks} \gets \Call{SAM2RePrompt}{\mathit{images},\Call{Project}{\mathit{state.dynamic}}}$
-    \State $\mathit{anchors} \gets \Call{Triangulate}{\Call{MaskCentroids}{\mathit{masks}}}$
+    \State $\mathit{masks} \gets \textsc{SAM2RePrompt}(\mathit{images},\mathit{state.dynamic})$
+    \State $\mathit{anchors} \gets \textsc{TriangulateMaskCentroids}(\mathit{masks})$
   \Else
-    \State $\mathit{masks},\mathit{anchors} \gets \varnothing,\varnothing$
+    \State $\mathit{masks},\mathit{anchors} \gets \emptyset,\emptyset$
   \EndIf
-  \State $\mathit{offsets} \gets \Call{OptimizeControls}{L_1{+}\mathrm{D\text{-}SSIM},\mathit{masks},\mathit{anchors},\mathrm{ARAP},\mathrm{temporal}}$
-  \State $\mathit{state} \gets \Call{Bake}{\Call{FusedRigidMLS}{\mathit{state},\mathit{controls},\mathit{offsets}}}$
+  \State $\mathit{offsets} \gets \textsc{OptimizeControls}(L_1{+}\mathrm{D\text{-}SSIM},\mathit{masks},\mathit{anchors},\mathrm{ARAP})$
+  \State $\mathit{state} \gets \textsc{BakeFusedRigidMLS}(\mathit{state},\mathit{controls},\mathit{offsets})$
   \If{$f \bmod 10 \ne 0$}
-    \State $\mathit{state} \gets \Call{Refine}{\Call{DynamicContentCrops}{\mathit{state},\mathit{images}},100,\mathit{noDensify}}$
+    \State $\mathit{state} \gets \textsc{RefineDynamicCrops}(\mathit{state},\mathit{images},100)$
   \Else
-    \State $\mathit{state} \gets \Call{Refine}{\mathit{images},500,\mathit{boundedDensify}}$
-    \State $\mathit{controls} \gets \Call{Rebind}{\mathit{state},\mathit{controls}}$; \Call{CacheBackground}{\mathit{state}}
+    \State $\mathit{state} \gets \textsc{RefineFullImages}(\mathit{state},\mathit{images},500)$
+    \State $\mathit{controls} \gets \textsc{Rebind}(\mathit{state},\mathit{controls})$; \textsc{CacheBackground}($\mathit{state}$)
   \EndIf
-  \State \Call{SaveDiagnostics}{\mathit{state}}
+  \State \textsc{SaveDiagnostics}($\mathit{state}$)
 \EndFor
 \end{algorithmic}
 \end{algorithm}
