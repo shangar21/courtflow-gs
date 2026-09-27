@@ -1,13 +1,13 @@
 """One-command canonical reconstruction, dynamic tracking, evaluation, and final renders.
 
-The input config contains machine-specific paths for videos, calibration, SAM2, and held-out
-evaluation data.  ``--train-dir`` replaces its ``data_root``, making the dataset directory the
-only required data argument for each training run.
+Use ``--dataset-dir`` for the raw capture layout (``cameras/`` + ``calibration/``); the runner
+bootstraps all pinhole inputs itself. ``--train-dir`` remains available for already prepared
+Stage-A image datasets.
 
 Example:
 
-    python -m ring_init.e2e --scene basketball --train-dir /datasets/ring_init_data \
-      --config ring_init/configs/basketball.local.json --out-dir /outputs/ring_final
+    python -m ring_init.e2e --scene basketball --dataset-dir /datasets/basketball_capture \
+      --config ring_init/configs/config.local.json --out-dir /outputs/ring_final
 """
 from __future__ import annotations
 import argparse
