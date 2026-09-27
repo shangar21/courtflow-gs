@@ -1,0 +1,133 @@
+\documentclass[11pt]{article}
+\usepackage[margin=0.9in]{geometry}
+\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref}
+\hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+\newcommand{\method}{\textsc{CourtFlow-GS}}
+\newcommand{\pro}{\textcolor{red}{[measure on RTX PRO 6000]}}
+\title{\method: Online Multi-View Dynamic Gaussian Reconstruction with Fused MLS Tracking}
+\author{Sharan Shankar}
+\date{\today}
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\method reconstructs a frame-0 canonical Gaussian scene from a calibrated basketball-camera ring,
+then tracks dynamic motion with group-aware control points, fused rigid moving-least-squares
+(MLS), mask/centroid constraints, focused refinement, and periodic keyframes. The final
+300-frame diagnostic produces novel-view videos and baked Gaussian checkpoints. All timing below
+is measured on an RTX 3080 12 GB; RTX PRO 6000 fields are intentionally reserved for replication.
+\end{abstract}
+
+\section{Problem and data}
+The data contains 36 synchronized 4K ring cameras with fixed known calibration. Views
+$0,3,\ldots,33$ train the model; the other 24 are held out. Camera poses are never optimized.
+The raw-capture adapter accepts \texttt{cameras/view\_XXX.mp4} and
+\texttt{calibration/cameras.txt}, \texttt{images.txt}, producing half-resolution pinhole inputs.
+
+\section{Methodology}
+\subsection{Canonical frame-0 reconstruction}
+Stage A undistorts images, detects people, prompts SAM2 masks, and associates instances through
+3D occupancy carving. For each person, an occlusion-aware visual hull intersects the backprojected
+mask cones. A view does not carve a candidate voxel when a known foreground/static occluder
+explains its missing silhouette. MASt3R runs in person-specific crops; matches are triangulated
+with fixed cameras and rejected for poor reprojection, weak baseline, hull inconsistency, or
+cross-view colour inconsistency. The accepted points initialize separate person Gaussian models
+and a background model.
+
+\subsection{Group-aware control-point MLS}
+Each Gaussian is bound to its $K=8$ nearest controls from the \emph{same} group. Its fixed radial
+basis weights are
+\[
+w_i(g)=\frac{\exp(-\|x_g-c_i\|^2/2\sigma^2)}{\sum_{j=1}^{K}\exp(-\|x_g-c_j\|^2/2\sigma^2)}.
+\]
+Thus player splats cannot be pulled by other players or background controls. At each frame the
+optimizer estimates one shared translation per movable group plus local control offsets. A fused
+CUDA rigid-MLS kernel transforms Gaussian means, orientations, and degree-1 SH coefficients.
+The loss combines $L_1+$D-SSIM, per-instance mask BCE, ARAP using local MLS rotations, temporal
+acceleration, and triangulated mask-centroid anchors. Dynamic-only deformation freezes the
+background controls between keyframes and composites dynamic splats over a cached background.
+
+\begin{figure}[H]
+\centering
+\fbox{\parbox[c][2.25in][c]{0.92\linewidth}{\centering\Large\textbf{Architecture diagram placeholder}\\[0.6em]
+\normalsize Suggested diagram: 12-camera images $\rightarrow$ SAM2 masks/centroid anchors
+$\rightarrow$ group controls $\rightarrow$ fused MLS $\rightarrow$ dynamic/background composite
+$\rightarrow$ focused refinement and periodic keyframe.}}
+\caption{Reserved space for a final CourtFlow-GS system diagram.}
+\end{figure}
+
+\subsection{Focused refinement}
+After every non-keyframe deformation, dynamic Gaussians are projected into every camera. Their
+padded, tile-aligned union crop is refined for 100 Gaussian iterations without densification.
+Every tenth frame receives 500 full-image iterations with bounded densification and a
+Gaussian-control rebind. The model state is baked forward after each frame.
+
+\subsection{Pseudocode}
+\begin{verbatim}
+state, controls = build_canonical_scene(frame0, fixed_calibration)
+for frame in sequence:
+    images = decode_undistort_normalize(training_videos, frame)
+    if frame % 5 == 0:
+        masks = SAM2_reprompt(images, project(state.dynamic))
+        anchors = triangulate(mask_centroids(masks))
+    offsets = optimize(group_translation + local_control_offsets,
+                       L1_DSSIM + mask_BCE + ARAP + temporal + anchors)
+    state = bake(fused_rigid_MLS(state, controls, offsets))
+    if frame % 10 != 0:
+        state = refine(dynamic_content_crops(state, images), 100, no_densify)
+    else:
+        state = refine(full_images, 500, bounded_densify)
+        controls = rebind(state, controls); cache_background(state)
+    save_metrics_checkpoint_and_novel_view_render(state)
+\end{verbatim}
+
+\section{Results}
+\begin{table}[H]\centering
+\caption{Quality summary. Temporal held-out samples coincide with keyframes.}
+\begin{tabular}{lrrrr}\toprule
+Method & Full PSNR & Person PSNR & Person IoU & Measurement \\\midrule
+Global 3DGS baseline & 17.50 & -- & -- & frame-0 held-out \\
+Stage A canonical & 19.32 & 18.34 & 0.788 & frame-0 held-out \\
+Stage B v1 & 18.29 & 15.00 & 0.70$\rightarrow$0.30 & keyframe held-out mean \\
+Stage B v2 (old) & 18.87 & 19.62 & 0.71$\rightarrow$0.39 & keyframe held-out mean \\
+Focused refinement, frames 1--20 & 22.42 & 26.76 & 0.746 & training-view mean \\
+Final 300-frame diagnostic & 20.07 & 22.44 & -- & held-out mean \\\bottomrule
+\end{tabular}\end{table}
+
+\begin{figure}[H]\centering
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_gt_f200.png}\\\small Ground truth, view 13, frame 200
+\end{minipage}\hfill
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_v2_f200.png}\\\small Earlier Stage B v2
+\end{minipage}\hfill
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_courtflow_f200.png}\\\small CourtFlow-GS diagnostic
+\end{minipage}
+\caption{Same-camera comparison at held-out view 13, frame 200. Replace or add comparison rows as desired.}
+\end{figure}
+
+\section{RTX 3080 runtime}
+\begin{table}[H]\centering
+\caption{Runtime.}\begin{tabular}{lrr}\toprule
+Component & RTX 3080 12 GB & RTX PRO 6000 \\\midrule
+MLS deformation/control optimization & 1.95 s/frame & \pro \\
+Focused crop refinement & 3.41 s/non-keyframe & \pro \\
+500-step full keyframe & 23.16 s/keyframe & \pro \\
+Mask refresh, amortized & 0.33 s/frame & \pro \\
+End-to-end diagnostic & 7.61 s/frame (0.131 FPS) & \pro \\
+GPU SH colour + baked raster, 937$\times$527 & 4.36 ms (229 FPS) & \pro \\\bottomrule
+\end{tabular}\end{table}
+
+The fused MLS/SVD path is a small fraction of tracking time; rasterization forward/backward
+dominates optimization. Baked-state GPU rendering is fast, while Python-to-ffmpeg transfer limits
+the current encoded-video exporter.
+
+\section{Limitations and next steps}
+Crowded late-game plays cause independent per-camera SAM2 identities to swap or disappear. In the
+final diagnostic, training IoU falls from 0.789 near the start to 0.001 at frame 299; held-out
+person PSNR falls from 23.86 to 20.59 dB. The highest-priority improvement is detector-led,
+multi-view identity association at keyframes. Additional work includes checkpoint consolidation or
+LOD for the 2.01M-Gaussian final state, unbiased inter-keyframe held-out evaluation, and direct
+GPU-to-NVENC output.
+\end{document}

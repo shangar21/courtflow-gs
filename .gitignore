@@ -20,6 +20,11 @@ __pycache__/
 ring_init/**/build/
 .DS_Store
 
+# LaTeX build intermediates (the source PDF and selected comparison figures are tracked).
+report/*.aux
+report/*.log
+report/*.out
+
 # Local configuration may contain machine-specific paths and checkpoints.
 ring_init/configs/*.local.json
 ring_init/configs/basketball.json
