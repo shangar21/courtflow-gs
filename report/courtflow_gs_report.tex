@@ -34,26 +34,33 @@ are never optimized. RGB is divided by 255.  The 12 training cameras are every t
 matching, training, or evaluation.
 
 \subsection{Canonical frame-0 reconstruction}
-\paragraph{Masks and 3D identities.}
-On frame 0, Faster R-CNN detects people (score $\geq0.5$) and SAM2 refines every on-court box;
-masks smaller than 64 pixels are discarded. Identities are established in 3D rather than by
-chaining 2D detections. Fit the court plane with RANSAC on full-frame MASt3R triangulations and,
-when needed, estimate metric scale from a 1.9 m person-height prior. Make a court-aligned grid of
-5 cm voxels, 2.4 m high, with a 1 m horizontal margin. Keep a voxel if it projects into the union
-foreground mask in at least $\max(4,n_{\mathrm{visible}}-2)$ cameras. Form 26-connected components,
-reject components with fewer than 30 voxels, height below 1.2 m, or a bottom implausibly above the
-floor, and split a footprint exceeding 1.1 m into
-$\lceil\mathrm{maximum\ footprint\ extent}/1.1\rceil$ floor-plane k-means clusters. Sort components
-by floor $(u,v)$ to assign deterministic IDs.
+\paragraph{Why masks and 3D identities are necessary.}
+Photometric reconstruction alone is too ambiguous for the moving players: each player occupies a
+small portion of a frame, shares colour and texture with teammates, and is frequently overlapped
+by another player or the basket structure.  A foreground mask supplies three otherwise missing
+signals: it removes background rays from player correspondence search, constrains Gaussian alpha
+to the observed silhouette, and, once given a persistent identity, tells the optimizer which
+Gaussian/control-point group should explain each pixel.  This prevents a global reconstruction
+from improving RGB error by assigning one player's appearance or motion to another player or to
+the background.
 
-Project each component into each camera, splat its projected coarse voxels to a silhouette, and
-Hungarian-match detector masks to those silhouettes. Accept matches only at IoU $\geq0.20$. For an
-unmatched component, re-prompt SAM2 with its projected box and centroid. Accept this recovery only
-if its 16-by-16 HSV histogram has Bhattacharyya distance $\leq0.5$ from the median histogram of
-that component's accepted masks in other views. A failed recovery leaves the camera \emph{unlabelled}
-for that identity---it is not background evidence. Resolve overlapping accepted masks by nearest
-median component depth. This yields mutually exclusive integer labels $L_c$ (0 is background) and
-median label depths $d_{c,k}$.
+Independent per-camera detector/SAM2 tracks are not sufficient because their instance numbers
+have no cross-view meaning.  We first tried centroid-ray/epipolar matching with colour histograms;
+with 12 views about $30^\circ$ apart, it fragmented 68 masks into 60 apparent identities.  We also
+found that full-frame MASt3R is too low-resolution for the players, producing ray-like geometry.
+CourtFlow-GS therefore obtains identity \emph{in 3D first}: Faster R-CNN boxes (score $\geq0.5$)
+are refined with SAM2, their union masks carve a court-aligned 5 cm occupancy volume, and its
+connected components define candidate physical players.  Components are then projected back to
+each camera and Hungarian-matched to the local SAM2 masks; missed detections are re-prompted from
+the projection.  This turns noisy local masks into a single, stable player ID across all views.
+
+The reconstruction uses a 2.4 m-high, 1 m-padded court volume; a voxel needs support in at least
+$\max(4,n_{\mathrm{visible}}-2)$ views.  Implausible components are rejected by size, height, and
+floor contact, and wide footprints are split in the floor plane.  A re-prompt is accepted only
+when its HSV appearance agrees with the same 3D component in other views.  If it does not, that
+camera is left unlabelled rather than treating the player as background.  Depth-ordered overlap
+resolution produces one mutually exclusive label image $L_c$ per camera, which is what makes the
+later per-instance mask loss and separate MLS groups meaningful.
 
 \paragraph{Occlusion-aware visual hull.}
 For identity $k$, make a 1 cm grid in the coarse-component bounds plus two coarse-voxel margins.
@@ -71,25 +78,20 @@ forgiven merely because occlusion is possible: it is forgiven only when a measur
 or static depth demonstrates an occluder. An unlabelled camera casts no vote. This is the precise
 meaning of ``occlusion-aware'' in this method.
 
-\paragraph{Per-instance crop MASt3R points and Gaussian seeds.}
-For every identity and each adjacent/skip-one ring pair $(c,c+1)$ and $(c,c+2)$, use the tight
-label box, enlarge its side by 35\%, enforce a 96-pixel minimum, clip by translation to the image,
-and resize the square crop to $512\times512$. Dilate the source mask by two pixels and query
-MASt3R reciprocal nearest neighbours only at every second source-mask pixel. Map crop coordinates
-back with $u=(u_{512}+0.5)s^{-1}-0.5+x_0$ (and analogously for $v$). Retain a correspondence iff
-confidence is $\geq1.5$, both endpoints lie in their identity masks, both depths are positive,
-maximum reprojection error is below 1.5 pixels, triangulation angle is at least $3^\circ$, and the
-DLT point lies in the one-voxel-dilated hull. It must also be label-consistent and have mean RGB
-$L_1<0.12$ in at least one non-anchor camera.
+\paragraph{Masked crop geometry and Gaussian seeds.}
+The masks also make correspondence estimation practical.  Instead of matching tiny people in a
+full $512$-pixel image, CourtFlow-GS crops a padded square around the same 3D identity in each
+adjacent/skip-one camera pair and resizes it to $512\times512$.  Reciprocal MASt3R matching is
+seeded only inside the source mask.  After mapping matches back to the original cameras, we retain
+only confident, positive-depth, low-reprojection-error, sufficiently wide-baseline points that
+fall inside the person's dilated visual hull and agree in at least one extra labelled view.  This
+rejects the floor/background rays that a mask majority vote admitted in earlier experiments.
 
-Those points are accurate surface seeds. Add only surface hull voxels farther than two hull voxels
-from a seed, thereby filling weak texture without duplicating matched surfaces. Assign each point
-the median colour across label-consistent self-z-buffer-visible views, remove statistical outliers
-(20 neighbours, 2 standard deviations), and fuse at 5 mm for people. Background uses full-frame
-matches outside person hulls dilated by 10 cm and the same colour test, fused at 10 cm. Initialize
-one normal-oriented, anisotropic degree-1-SH Gaussian per fused point with opacity 0.5, a
-third-neighbour scale, and normal-axis scale 0.1 times tangent scale. Persons train for 7000
-iterations (four cameras/step) and background for 10000 (two cameras/step), using
+The retained points are accurate surface seeds; surface hull voxels only fill gaps farther than two
+hull voxels from a seed, where texture was inadequate for matching.  We colour points from
+label-consistent, self-z-buffer-visible views, remove outliers, fuse people at 5 mm and background
+at 10 cm, then initialize normal-oriented, anisotropic degree-1-SH Gaussians. Persons train for
+7000 iterations (four cameras/step) and background for 10000 (two cameras/step), using
 \[
 \mathcal L_{\rm image}=\|I-\hat I\|_1+0.2\,\mathrm{D\mbox{-}SSIM}
 +0.1\mathcal L_{\rm alpha}+0.05\mathcal L_{\rm depth}.
