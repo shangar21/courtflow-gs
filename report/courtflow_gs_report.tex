@@ -3,169 +3,194 @@
 \usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref,algorithm,algpseudocode}
 \usepackage{mathptmx} % Times New Roman-compatible text and mathematics
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
-\newcommand{\method}{\textsc{CourtFlow-GS}}
+\newcommand{\method}{\textsc{CourtFlow-GS }}
 \newcommand{\pro}{\textcolor{red}{[measure on RTX PRO 6000]}}
 \title{\method: Online Multi-View Dynamic Gaussian Reconstruction with Fused MLS Tracking}
-\author{Sharan Shankar}
+\author{Shangar Muhunthan}
 \date{\today}
 \begin{document}
 \maketitle
 
 \begin{abstract}
-\method reconstructs a frame-0 canonical Gaussian scene from a calibrated basketball-camera ring,
-then tracks dynamic motion with group-aware control points, fused rigid moving-least-squares
-(MLS), mask/centroid constraints, focused refinement, and periodic keyframes. The final
-300-frame diagnostic produces novel-view videos and baked Gaussian checkpoints. All timing below
-is measured on an RTX 3080 12 GB; RTX PRO 6000 fields are intentionally reserved for replication.
+\method turns synchronized videos from cameras around a basketball court into a 3D scene that can
+be viewed from a new camera angle. It first builds one clean, static ``starting scene'' from frame
+0. It then follows each player through the video by moving small sets of control points, and
+occasionally improves visual detail. The result is a 300-frame 3D reconstruction, novel-view
+videos, and a saved Gaussian model that can be rendered later without retraining.
 \end{abstract}
 
 \section{Problem and data}
-The data contains 36 synchronized 4K ring cameras with fixed known calibration. Views
-$0,3,\ldots,33$ train the model; the other 24 are held out. Camera poses are never optimized.
-The raw-capture adapter accepts \texttt{cameras/view\_XXX.mp4} and
-\texttt{calibration/cameras.txt}, \texttt{images.txt}, producing half-resolution pinhole inputs.
+The data contains 36 synchronized 4K cameras placed in a ring around the court. Their positions,
+orientations, and lenses have already been calibrated, so the system knows exactly where every
+camera is. We train with every third camera (views $0,3,\ldots,33$) and keep the remaining 24
+cameras aside for an honest test from viewpoints the model did not see during training. The camera
+calibration is fixed throughout the method.
+
+The input adapter reads \texttt{cameras/view\_XXX.mp4} together with
+\texttt{calibration/cameras.txt} and \texttt{images.txt}. It creates an undistorted,
+half-resolution working copy for training. This preserves the camera geometry while making the
+many repeated training renders practical on the RTX 3080.
 
 \section{Methodology}
-This section specifies the reported configuration so that the method can be recreated without
-reading the implementation.  Let $P_c=K_c[R_c\mid t_c]$ be a fixed undistorted pinhole camera,
-with world-to-camera convention $x_c=R_cx+t_c$.  Camera poses, intrinsics, and photometric gains
-are never optimized. RGB is divided by 255.  The 12 training cameras are every third camera of the
-36-camera ring; all other cameras are held out. Every input is undistorted before segmentation,
-matching, training, or evaluation.
+Before doing anything else, every image is undistorted. This removes lens bending, so a straight
+camera ray in the mathematics corresponds to a straight ray in the image. In the notation used
+later, camera $c$ is $P_c=K_c[R_c\mid t_c]$, with world-to-camera conversion $x_c=R_cx+t_c$.
+Readers do not need this equation to follow the method: it only says that the known calibration
+projects a 3D point into each image. Camera poses, lens parameters, and per-camera brightness
+corrections are kept fixed.
 
-\subsection{Canonical frame-0 reconstruction}
-\paragraph{Why masks and 3D identities are necessary.}
-Photometric reconstruction alone is too ambiguous for the moving players: each player occupies a
+\subsection{Frame-0 Reconstruction}
+\paragraph{Masks and 3D identities:}
+Photometric reconstruction alone is too ambiguous for the moving players. Each player occupies a
 small portion of a frame, shares colour and texture with teammates, and is frequently overlapped
-by another player or the basket structure.  A foreground mask supplies three otherwise missing
-signals: it removes background rays from player correspondence search, constrains Gaussian alpha
-to the observed silhouette, and, once given a persistent identity, tells the optimizer which
+by another player or various structures / elements in the scene. 
+Foreground masks tell the system both ``which pixels belong to this person for geometry matching''
+and ``where this person is allowed to appear when rendered.''
+This prevents background splats from being absorbed into players and prevents players from
+growing fuzzy opaque halos onto the court. It also tells the optimizer which
 Gaussian/control-point group should explain each pixel.  This prevents a global reconstruction
 from improving RGB error by assigning one player's appearance or motion to another player or to
 the background.
 
-Independent per-camera detector/SAM2 tracks are not sufficient because their instance numbers
-have no cross-view meaning.  We first tried centroid-ray/epipolar matching with colour histograms;
-with 12 views about $30^\circ$ apart, it fragmented 68 masks into 60 apparent identities.  We also
-found that full-frame MASt3R is too low-resolution for the players, producing ray-like geometry.
-CourtFlow-GS therefore obtains identity \emph{in 3D first}: Faster R-CNN boxes (score $\geq0.5$)
-are refined with SAM2, their union masks carve a court-aligned 5 cm occupancy volume, and its
-connected components define candidate physical players.  Components are then projected back to
-each camera and Hungarian-matched to the local SAM2 masks; missed detections are re-prompted from
-the projection.  This turns noisy local masks into a single, stable player ID across all views.
+Simply running a detector in each camera is not enough: ``person 4'' in one image has no reason to
+be the same physical person as ``person 4'' in another. We first tried matching 2D mask centres
+and colours between cameras. With cameras about $30^\circ$ apart, that split 68 masks into 60
+supposed people. Full-frame MASt3R matching was also too coarse for small players and made
+unreliable star-shaped rays. Instead, CourtFlow-GS establishes identity \emph{in 3D first}.
 
-The reconstruction uses a 2.4 m-high, 1 m-padded court volume; a voxel needs support in at least
-$\max(4,n_{\mathrm{visible}}-2)$ views.  Implausible components are rejected by size, height, and
-floor contact, and wide footprints are split in the floor plane.  A re-prompt is accepted only
-when its HSV appearance agrees with the same 3D component in other views.  If it does not, that
-camera is left unlabelled rather than treating the player as background.  Depth-ordered overlap
-resolution produces one mutually exclusive label image $L_c$ per camera, which is what makes the
-later per-instance mask loss and separate MLS groups meaningful.
+Faster R-CNN proposes person boxes (score $\geq0.5$), and SAM2 turns each box into a precise
+foreground mask. We use agreement between those masks to make rough 3D blobs, where each blob is
+a likely physical player. We project each blob back into every camera and match it to the local
+SAM2 mask. When a mask is missing, the projected blob tells SAM2 where to look again. In this way,
+noisy per-camera masks become one consistent player ID across the ring.
+
+Concretely, we cover the court with a 2.4 m-high box that extends 1 m beyond the court lines, and
+divide it into small cubes called voxels. A voxel is kept only if enough cameras see it inside a
+person mask: at least $\max(4,n_{\mathrm{visible}}-2)$ cameras. Put simply, several cameras must
+agree, but up to two are allowed to disagree because a player can be hidden. We discard blobs that
+are too small, too short, or floating above the floor. A blob wide enough to contain two people is
+split on the court floor.
+
+For a missing camera mask, we accept the new SAM2 result only if its colour is similar to that same
+3D player in the other cameras. If it still looks wrong, we mark that player as \emph{unknown} in
+that camera---not as background. This is important: a hidden or missed player should not teach the
+model that the court is visible there. Finally, if two accepted masks overlap, the closer player
+owns the pixel. The result is one label image $L_c$ per camera in which every pixel is either
+background or exactly one player. Later, this lets every player have separate Gaussian splats and
+separate motion controls.
 
 \paragraph{Occlusion-aware visual hull.}
-The conventional visual-hull rule is an intersection: remove a voxel whenever any calibrated view
-does not see it in the silhouette.  It is effective for clean turntable captures but is too strict
-for a game: the basket stanchion, padding, and nearer players hide genuine heads, limbs, and feet.
-We observed exactly that failure with a strict hull.  The opposite workaround---allowing arbitrary
-missing views---was worse: one allowed miss inflated player hulls by roughly $2.5\times$.  The
-chosen rule therefore keeps the precision of a strict hull while exempting a disagreement only
-when a nearer reconstructed surface gives a physical explanation for it.
+A visual hull is a rough 3D body made by intersecting the player silhouettes from several cameras.
+The usual rule says to remove a voxel if even one camera does not see the player there. That works
+for a clean object on a turntable, but fails in basketball: another player, the hoop support, or
+padding can hide a real arm, leg, or head. We saw those missing body parts with a strict hull.
 
-For identity $k$, make a 1 cm grid in the coarse-component bounds plus two coarse-voxel margins.
-Camera $c$ gives a candidate voxel $x$ a negative vote only if $x$ is in its frustum, $c$ has an
-accepted label for $k$, $L_c(\pi_c(x))\ne k$, and no nearer reconstructed surface explains the
-absence. The absence is explained if either (i) the pixel belongs to another labelled identity $j$
-with $d_{c,j}<d_{c,k}$, or (ii) a static depth map obeys
-$D_c(\pi_c(x))<z_c(x)-0.30$ m. Build $D_c$ from full-frame MASt3R points labelled background and
-colour-consistent in at least two extra views, keeping nearest depth after a 4-pixel square splat;
-exclude points within 0.5 m of the floor.
+The opposite rule---forgiving any missing view---was also bad. One allowed miss made player hulls
+about $2.5\times$ too large. Our compromise asks one simple question: \emph{is there measured
+evidence that something closer to this camera was blocking the player?} We forgive a missing pixel
+only when the answer is yes. This is what ``occlusion-aware'' means here.
 
-Retain $x$ iff it is observed inside $k$'s label in at least two cameras and has zero unexplained
-negative votes; then remove voxels below the floor. Therefore a missing silhouette pixel is not
-forgiven merely because occlusion is possible: it is forgiven only when a measured nearer dynamic
-or static depth demonstrates an occluder. An unlabelled camera casts no vote. This is the precise
-meaning of ``occlusion-aware'' in this method.
+For each player, we test a fine 1 cm grid inside the rough 3D blob, with a small margin. Camera
+$c$ votes against a candidate voxel $x$ only when the voxel is visible in that camera, the player
+has a trusted label there, the projected pixel is not labelled as that player, and nothing nearer
+explains why. A nearer explanation can be another labelled player or a measured background surface
+(such as the hoop support) at least 30 cm in front. The background depth map $D_c$ comes from
+reliable full-frame MASt3R background points that agree in at least two additional cameras. We
+retain the nearest depth at each image location and ignore floor points within 0.5 m of the court.
+
+We keep $x$ when at least two cameras see it as the player and no camera has an \emph{unexplained}
+reason to reject it. Voxels below the floor are then removed. A camera where the player is unknown
+casts no vote. Thus the method does not keep geometry merely because occlusion might be possible;
+it keeps it only when a nearer player or surface actually supports that explanation.
 
 \paragraph{Masked crop geometry and Gaussian seeds.}
-Standard full-frame feature matching works well for the court and background, but not for a player
-that is only about $6\times25$ pixels at MASt3R's 512-pixel full-frame resolution.  Our full-frame
-player matches produced a radial ``star'' of unreliable rays.  The identity masks let the method
-allocate descriptor resolution where it matters: CourtFlow-GS crops a padded square around the
-same 3D identity in each adjacent/skip-one camera pair and resizes it to $512\times512$.
-Reciprocal MASt3R matching is seeded only inside the source mask.  After mapping matches back to
-the original cameras, retain only confident, positive-depth, low-reprojection-error,
-sufficiently-wide-baseline points inside the person's dilated visual hull that agree in at least
-one extra labelled view.  This rejects the floor/background rays that a mask majority vote
-admitted in earlier experiments.
+Feature matching across a full image works for the court, but a distant player may occupy only
+about $6\times25$ pixels once MASt3R shrinks the whole frame to 512 pixels. Our full-frame player
+matches made a radial ``star'' of unreliable 3D rays. The masks solve this by giving the player
+the full matching resolution: for nearby camera pairs, we crop a padded square around the same 3D
+player and resize that crop to $512\times512$. MASt3R searches only inside the source player mask.
 
-The retained points are accurate surface seeds; surface hull voxels only fill gaps farther than two
-hull voxels from a seed, where texture was inadequate for matching.  We colour points from
-label-consistent, self-z-buffer-visible views, remove outliers, fuse people at 5 mm and background
-at 10 cm, then initialize normal-oriented, anisotropic degree-1-SH Gaussians. Persons train for
-7000 iterations (four cameras/step) and background for 10000 (two cameras/step), using
+After mapping matches back into the original camera images, we retain only confident matches that
+are in front of the cameras, reproject accurately, use cameras far enough apart for useful depth,
+lie inside a slightly expanded player hull, and agree with at least one more labelled camera. This
+removes the court and background rays that slipped through earlier mask-only tests.
+
+The retained matches are accurate surface seeds. Hull voxels fill only textureless gaps more than
+two hull voxels away from a seed. We colour points only from cameras that agree with the label and
+can actually see the point, remove outliers, merge nearby player points at 5 mm and background
+points at 10 cm, and turn the result into oriented, elongated Gaussian splats. Each Gaussian stores
+position, shape, opacity, and simple view-dependent colour (degree-1 spherical harmonics).
+Players train for 7000 iterations (four cameras per step) and background for 10000 (two cameras
+per step), using
 \[
 \mathcal L_{\rm image}=\|I-\hat I\|_1+0.2\,\mathrm{D\mbox{-}SSIM}
 +0.1\mathcal L_{\rm alpha}+0.05\mathcal L_{\rm depth}.
 \]
-Depth weight decays to zero halfway through training. Densification starts at iteration 500 and
-runs every 100 iterations until halfway; prune opacity below 0.01 and splats outside a
-3-pixel-dilated mask in two views.
+This loss asks the rendered image to match the real image, its structure, its silhouette, and its
+initial depth. The depth term fades out halfway through training, after it has helped establish the
+coarse shape. Starting at iteration 500, we add detail where needed every 100 iterations until
+halfway through training. We remove nearly transparent splats and splats that land outside an
+expanded player mask in two cameras.
 
 \subsection{Group-aware control-point MLS}
-\paragraph{Why group-aware deformation.}
-A conventional global deformation graph, including the all-controls weighting used by methods such
-as QuickCapture, is appropriate for one connected deforming object.  It is unsafe for a crowded
-multi-person scene: nearby controls on different players can explain the same image error, so a
-player may pull a teammate or a background splat.  CourtFlow-GS treats each identity as a separate
-deformation domain, preserving the useful local smoothness of MLS without allowing cross-player
-coupling.  Compact eight-control support also keeps deformation memory and work linear in the
-number of Gaussians.
+\paragraph{Why use separate control groups?}
+After frame 0, the task is to move the same Gaussian splats as players move. Rather than moving
+millions of splats independently, we place a much smaller set of control points on each player.
+Moving a control point moves nearby splats smoothly. This is called moving-least-squares (MLS)
+deformation.
 
-Every dynamic Gaussian belongs to exactly one person (the ball, when enabled, is a separate
-group); background is group 0. Farthest-point sample 1024 controls per person, 16 for the ball,
-and 1000 for background. Each Gaussian is bound once to its $K=8$ nearest controls from the
-\emph{same} group. Its fixed radial-basis weights are
+A single global control graph is reasonable for one connected object, but unsafe in a crowded game.
+Controls on two nearby players can otherwise explain the same image error, causing one player to
+pull another player's splats or the background. CourtFlow-GS treats every identity as a separate
+motion group. This keeps the useful smooth motion of MLS while forbidding cross-player influence.
+
+Every dynamic Gaussian belongs to exactly one person; the ball, when enabled, is another group,
+and background is group 0. We choose controls spread evenly over each object: 1024 per person,
+16 for the ball, and 1000 for background. Each Gaussian is permanently connected to its eight
+nearest controls from the \emph{same} group. Closer controls get more influence through the fixed
+radial weights
 \[
 w_{ij}=\frac{\exp(-\|x_i-p_j\|^2/(2\sigma_j^2))}
 {\sum_{\ell=1}^{8}\exp(-\|x_i-p_\ell\|^2/(2\sigma_\ell^2))},
 \]
-where $\sigma_j$ is the mean distance from control $j$ to its three nearest controls. The six
-nearest same-group controls form the ARAP graph. Thus a player's splats cannot be moved by any
-other player or by background controls.
+where $\sigma_j$ is the average distance to control $j$'s three nearest controls. The six nearest
+same-group controls form the shape-preserving ARAP graph. In plain terms, a player's splats follow
+that player's nearby controls, never a teammate's or the court's.
 
-\paragraph{Why global-plus-local motion and rigid MLS.}
-Optimizing every control independently is a common deformation-graph choice, but fast bulk player
-motion made weakly observed controls lag and random-walk. In our comparison it reached 0.60 IoU at
-frame 10, versus 0.71 with a shared per-person translation plus local residual offsets. The shared
-term handles translation and the centroid-ray anchor re-acquires a player; the residual controls
-then express articulated motion. Rigid MLS and ARAP retain local shape better than independently
-moving splats, while still allowing a smooth non-rigid field.
+\paragraph{Why shared translation plus local motion?}
+Trying to move every control independently made weakly observed controls lag or drift. By frame 10
+that version reached 0.60 mask overlap (IoU), compared with 0.71 when each player first gets one
+shared translation and then small local offsets. The shared translation handles running across the
+court; the local offsets handle arms, legs, and other articulation. A rigid local MLS transform
+and the ARAP shape loss keep neighbouring splats from stretching apart.
 
-At frame $f$, warm-start control offsets from the previous control velocity. Optimize a shared
-translation $T_k$ per movable group and local control offsets $\delta_j$ for 50 Adam iterations,
-using four cameras/iteration and learning rates 0.020 m and 0.003 m respectively. Let
-$t_j=T_{g(j)}+\delta_j$, $p'_j=p_j+t_j$, and retain the fixed weights above. For Gaussian $i$,
+At frame $f$, controls begin from the previous frame's velocity. We optimize one shared translation
+$T_k$ per moving group and small local offsets $\delta_j$ for 50 Adam iterations, using four
+cameras per iteration. Their learning rates are 0.020 m and 0.003 m. Let
+$t_j=T_{g(j)}+\delta_j$ and $p'_j=p_j+t_j$. For Gaussian $i$, the fixed weights above blend nearby
+original controls $p_j$ and moved controls $p'_j$ to form a best local rotation $R_i$:
 \[
  \bar p_i=\sum_jw_{ij}p_j,\quad \bar q_i=\sum_jw_{ij}p'_j,\quad
  M_i=\sum_jw_{ij}(p_j-\bar p_i)(p'_j-\bar q_i)^T.
 \]
-With $M_i=USV^T$, set $R_i=VU^T$, flipping the last column of $V$ if $\det(VU^T)<0$. The baked
-position is $x'_i=R_i(x_i-\bar p_i)+\bar q_i$; orientation and degree-1 SH are also rotated by
-$R_i$. The fused CUDA operation evaluates this transform and its backward pass. The reported run
-does not blend separately optimized control rotations.
+With $M_i=USV^T$, set $R_i=VU^T$, flipping the last column of $V$ if $\det(VU^T)<0$. The final
+Gaussian position is $x'_i=R_i(x_i-\bar p_i)+\bar q_i$; its orientation and simple colour direction
+are rotated too. A fused CUDA operation performs this transform and its backward pass. The reported
+run does not separately optimize control rotations.
 
-Every fifth frame, render per-instance weights, prompt SAM2 with each rendered box and centroid,
-and resolve overlap by highest rendered instance weight. Triangulate each mask centroid by
-area-square-root-weighted least-squares ray intersection. Use the resulting displacement to
-initialize $T_k$, and apply a Huber anchor of scale 0.3 m and weight 0.1 when enough views observe
-the identity. On intervening frames, no mask or anchor is fabricated. The deformation objective is
+Every fifth frame, we render where each player is expected, prompt SAM2 with that box and centre,
+and assign overlapping pixels to the strongest rendered player. We triangulate the 2D mask centres
+from several cameras into a rough 3D player centre. This is a \emph{motion anchor}: it gives the
+shared translation a reliable hint about where a player moved, especially after fast motion or
+occlusion. If enough cameras see the player, a robust Huber anchor of scale 0.3 m and weight 0.1
+is used. Between those frames, no made-up mask or anchor is used. The deformation objective is
 \[
 \mathcal L=\mathcal L_{\rm image}+0.3\mathcal L_{\rm BCE}^{\rm instance}
 +\mathcal L_{\rm ARAP}+0.01\mathcal L_{\rm accel}+\mathcal L_{\rm anchor},
 \]
-where ARAP averages $\|(p'_a-p'_b)-R_a(p_a-p_b)\|^2/\|p_a-p_b\|^2$ over graph edges and
-acceleration is normalized second-order control displacement. During deformation, background
-controls are frozen and the dynamic raster is depth-composited over a cached background.
+Here the image term matches appearance, BCE matches each player's rendered mask, ARAP preserves
+local shape, acceleration discourages sudden jitter, and the anchor discourages global drift.
+Background controls stay frozen while the moving splats are rendered over a cached background.
 
 \begin{figure}[H]
 \centering
@@ -175,25 +200,28 @@ controls are frozen and the dynamic raster is depth-composited over a cached bac
 \end{figure}
 
 \subsection{Focused refinement}
-The MLS step supplies temporally coherent geometry but intentionally does not optimize Gaussian
-appearance or add new detail. A full-image 3DGS update after every frame is the usual alternative,
-but it spends most rasterization/backward work on the static court even though players cover less
-than 1\% of an image. Focused refinement concentrates the same photometric capacity on the moving
-content, while periodic full-image keyframes correct accumulated drift and permit limited growth.
-This division is why the method can improve player detail without constantly destabilizing the
-control bindings or paying keyframe cost every frame.
+MLS provides stable, smooth motion, but deliberately does not change a Gaussian's colour, size, or
+amount of detail. Updating the full image after every video frame would be wasteful: players cover
+less than 1\% of the court image, so most compute would repeatedly optimize the static floor. We
+therefore refine only the moving-player crops most frames, and use occasional full-image keyframes
+to correct drift and add a limited amount of new detail.
 
-Bake Gaussian and control state forward after every deformation. At a non-keyframe, project all
-dynamic Gaussians into every training camera, form their union box with 48 pixels of padding,
-snap it outward to the 16-pixel gsplat tile grid, shift the principal point by the crop origin, and
-run 100 refinement iterations on two crops/step. Tile alignment makes crop rasterization
-pixel-identical to the corresponding full render. This phase has no densification or pruning, so
-control bindings remain stable. Every tenth frame instead runs 500 full-image iterations, permits
-densification from iteration 50 every 50 steps until 60\% of the schedule, caps growth at 5\% per
-keyframe, rebinds each Gaussian to eight nearest same-group controls, and refreshes the background
-cache. Held-out cameras are never used in a loss.
+After every deformation, we save (``bake'') the moved Gaussian and control state for that frame.
+On a normal frame, all moving splats are projected into each training camera and surrounded by one
+box with 48 pixels of padding. The box is aligned to the rasterizer's 16-pixel tiles, and the camera
+principal point is shifted so rendering the crop is exactly equivalent to rendering that part of
+the full image. We run 100 refinement iterations on two crops per step. No splats are added or
+removed here, so their control bindings stay stable.
+
+Every tenth frame is a keyframe. It instead runs 500 full-image iterations, can add splats from
+iteration 50 every 50 iterations until 60\% of the schedule, and limits growth to 5\% per keyframe.
+It then reconnects each Gaussian to its eight nearest same-group controls and refreshes the cached
+background. Held-out cameras are never included in any training loss.
 
 \subsection{Pseudocode}
+Algorithm~\ref{alg:courtflow} summarizes the whole process. The helper names are intentionally
+literal: first build the frame-0 scene, then for each video frame estimate motion, bake that motion,
+and improve either player crops or a periodic full keyframe.
 \begin{algorithm}[H]
 \caption{CourtFlow-GS online reconstruction}\label{alg:courtflow}
 \begin{algorithmic}[1]
@@ -221,6 +249,10 @@ cache. Held-out cameras are never used in a loss.
 \end{algorithm}
 
 \section{Results}
+The final diagnostic reconstructs 300 frames. PSNR measures image similarity in decibels (higher is
+better); person PSNR measures it only on player regions; IoU measures how well predicted and true
+player masks overlap (1 is perfect). The diagnostic's held-out result is the important generalization
+measurement because those cameras were never trained on.
 \begin{table}[H]\centering
 \caption{Quality summary. Temporal held-out samples coincide with keyframes.}
 \begin{tabular}{lrrrr}\toprule
@@ -248,7 +280,8 @@ Final 300-frame diagnostic & 20.07 & 22.44 & -- & held-out mean \\\bottomrule
 
 \section{RTX 3080 runtime}
 \begin{table}[H]\centering
-\caption{Runtime.}\begin{tabular}{lrr}\toprule
+\caption{Runtime. A frame normally uses MLS, crop refinement, and occasionally the more expensive
+keyframe step.}\begin{tabular}{lrr}\toprule
 Component & RTX 3080 12 GB & RTX PRO 6000 \\\midrule
 MLS deformation/control optimization & 1.95 s/frame & \pro \\
 Focused crop refinement & 3.41 s/non-keyframe & \pro \\
@@ -258,15 +291,15 @@ End-to-end diagnostic & 7.61 s/frame (0.131 FPS) & \pro \\
 GPU SH colour + baked raster, 937$\times$527 & 4.36 ms (229 FPS) & \pro \\\bottomrule
 \end{tabular}\end{table}
 
-The fused MLS/SVD path is a small fraction of tracking time; rasterization forward/backward
-dominates optimization. Baked-state GPU rendering is fast, while Python-to-ffmpeg transfer limits
-the current encoded-video exporter.
+The fused MLS/SVD calculation is only a small part of tracking time. Rendering and differentiating
+through the rasterizer dominate optimization. Once motion is baked, GPU rendering is fast; the
+current video exporter is instead limited by copying frames from Python to ffmpeg.
 
 \section{Limitations and next steps}
-Crowded late-game plays cause independent per-camera SAM2 identities to swap or disappear. In the
-final diagnostic, training IoU falls from 0.789 near the start to 0.001 at frame 299; held-out
-person PSNR falls from 23.86 to 20.59 dB. The highest-priority improvement is detector-led,
-multi-view identity association at keyframes. Additional work includes checkpoint consolidation or
-LOD for the 2.01M-Gaussian final state, unbiased inter-keyframe held-out evaluation, and direct
-GPU-to-NVENC output.
+The main remaining weakness is identity tracking in crowded late-game plays. Independent SAM2 masks
+can swap people or disappear. In the final diagnostic, training IoU falls from 0.789 near the start
+to 0.001 at frame 299; held-out person PSNR falls from 23.86 to 20.59 dB. The highest-priority
+improvement is detector-led, multi-view identity association at keyframes. Other useful work is a
+smaller or level-of-detail version of the 2.01M-Gaussian final state, unbiased held-out evaluation
+between keyframes, and direct GPU-to-NVENC video output.
 \end{document}
