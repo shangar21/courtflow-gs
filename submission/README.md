@@ -6,7 +6,6 @@
 - `videos/` — final held-out-camera and orbit renders, plus the uncapped comparison.
 - `metrics/` — final-run summary JSON.
 - `code/` — source at commit `1e03d36` (or later if this package was rebuilt).
-- `EMAIL_DRAFT.txt` — ready-to-send delivery note.
 
 ## Reproducing playback
 
