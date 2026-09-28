@@ -434,7 +434,10 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
     else:   # copy the source run's frames start..resume_frame so the videos cover the whole range
         for key, w in writers.items():
             name = "orbit360.mp4" if key == "orbit" else f"heldout_view{key:02d}.mp4"
-            for rgb in _decode_video(s.out / resume_from[0] / "videos" / name, resume_frame - start + 1, *w.size): w.write_bytes(rgb)
+            try:
+                for rgb in _decode_video(s.out / resume_from[0] / "videos" / name, resume_frame - start + 1, *w.size): w.write_bytes(rgb)
+            except RuntimeError as e:   # an MP4 is only readable once its writer has closed it
+                raise RuntimeError(f"cannot copy the source run's video frames ({e}); resume only after the source run has finished") from e
     for f in range((start if resume_frame is None else resume_frame) + 1, end):
         a = time.time(); mask_frame = cfg.v2_mask_every <= 0 or (f - start) % cfg.v2_mask_every == 0
         full_imgs, small, labs = (loader.pop(f).result() if f in loader else load_frame(f))
