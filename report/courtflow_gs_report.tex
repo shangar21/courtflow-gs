@@ -21,6 +21,32 @@ video. The result is a 3D reconstruction, novel-view videos, and a saved Gaussia
 rendered from any camera without retraining.
 \end{abstract}
 
+\section*{TL;DR}
+\begin{itemize}
+\item \textbf{The task.} Rebuild a 28-second basketball game (700 frames) in 3D from 12 of its 36
+cameras, so it can be watched from any angle. Quality is judged only on the other 24 cameras, which
+the method never sees.
+\item \textbf{The idea.} Few cameras cannot pin down millions of freely moving points, so the method
+keeps the unknowns small. It builds frame 0 carefully once: each player is found in 3D and given a
+3D shape from masks and matched points. After that, every player moves by about a thousand control
+points, and every tenth frame the whole scene is refreshed. The court and crowd are built once and
+only lightly updated.
+\item \textbf{The results.} On one RTX PRO 6000 at $1920\times1080$, the whole game takes about two
+hours from raw videos to finished novel-view videos. The unseen cameras score 20.4~dB PSNR on average
+over all 700 frames. A strong existing method, ClipGStream, scored 17.2--17.9~dB on the same cameras,
+and only on the first 10 frames. A new view renders in 2--3~ms, over 300 frames per second even at 4K.
+\item \textbf{What we learned.} Longer training made the existing method \emph{worse} on unseen
+cameras, which shows it memorizes the 12 views. Our first full 700-frame run revealed that the scene
+kept growing until it fell apart, and capping its size made it faster, smaller and better at the same
+time. Training at native 4K was slower and did not beat the 1080p working resolution.
+\item \textbf{What is still weak.} Players in crowded plays late in the game become blurred or broken
+up, while the court and crowd stay clean. Better tracking of overlapping players is the next step.
+\item \textbf{Using it.} Playback needs no neural networks, only moving the points and drawing them.
+It can be served like cloud gaming (render on a server, stream video) or like game downloads (send
+compressed scene data, draw on the viewer's device).
+\end{itemize}
+
+
 \section{Problem and data}
 The data contains 36 synchronized 4K cameras placed in a ring around the court. Their positions,
 orientations, and lenses have already been calibrated, so the system knows exactly where every
