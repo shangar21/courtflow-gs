@@ -22,6 +22,17 @@ from ring_init.deform.track import CameraFrame, eval_colors
 from ring_init.gs.train import GaussianModel, View, ssim_map, train_gaussians
 
 
+def densify_cap(n_trained: int, growth: float, base: int, cap: float) -> int:
+    """Maximum size of the trained model after one densifying refinement.
+
+    ``growth`` limits a single keyframe relative to the current size. Without ``cap`` that limit
+    compounds (70 keyframes at 5% allow ~30x). ``cap > 0`` also bounds the total at
+    ``base * (1 + cap)``, where ``base`` is the same group's frame-0 size; it never forces pruning."""
+    limit = int(n_trained * (1 + growth))
+    if cap > 0: limit = min(limit, max(int(base * (1 + cap)), n_trained))
+    return limit
+
+
 class SceneTracker:
     def __init__(self, model: GaussianModel, ctrl: SceneControls, person_ids: list[int], cfg: Config):
         self.model, self.ctrl, self.cfg = model, ctrl, cfg
@@ -254,20 +265,20 @@ class SceneTracker:
         """
         c = self.cfg; t0 = time.time(); n0 = len(self.model)
         if focus: views = self.focus_views(views, c.v2_keyframe_focus_pad_px)
-        kcfg = replace(c, opacity_prune=0.0 if c.v2_keyframe_protect else c.opacity_prune, bg_iterations=iterations, bg_views_per_step=views_per_step,
-                       t0_lr_means=c.v2_keyframe_lr_means, t0_lr_means_final_factor=1.0, drop_gaussian=False, depth_weight=0.0,
-                       densify_start_iter=c.v2_keyframe_densify_start if densify else iterations + 1,
-                       densify_every=c.v2_keyframe_densify_every, densify_until_fraction=c.v2_keyframe_densify_until if densify else 0.0,
-                       bg_max_gaussians=int(n0 * (1 + growth)))
-        trained, frozen = self.model, None
+        trained, frozen, base = self.model, None, self.n_canon
         if dynamic_only:
-            from ring_init.gs.export import concat_models
-            from ring_init.gs.train import GaussianModel, PARAM_KEYS
+            from ring_init.gs.train import PARAM_KEYS
             bg = self.model.params["instance_ids"] == 0
             if not bool(bg.any()) or bool(bg.all()):
                 raise RuntimeError("dynamic-only refinement requires both background and dynamic Gaussians")
             trained = GaussianModel({k: self.model.params[k][~bg] for k in PARAM_KEYS}, self.model.params["instance_ids"][~bg])
             frozen = GaussianModel({k: self.model.params[k][bg] for k in PARAM_KEYS}, self.model.params["instance_ids"][bg])
+            base = self.n_canon_dynamic
+        kcfg = replace(c, opacity_prune=0.0 if c.v2_keyframe_protect else c.opacity_prune, bg_iterations=iterations, bg_views_per_step=views_per_step,
+                       t0_lr_means=c.v2_keyframe_lr_means, t0_lr_means_final_factor=1.0, drop_gaussian=False, depth_weight=0.0,
+                       densify_start_iter=c.v2_keyframe_densify_start if densify else iterations + 1,
+                       densify_every=c.v2_keyframe_densify_every, densify_until_fraction=c.v2_keyframe_densify_until if densify else 0.0,
+                       bg_max_gaussians=densify_cap(len(trained), growth, base, c.v2_growth_cap))
         stats = train_gaussians(trained, views, kcfg, "background", log_path, frozen=frozen)
         if frozen is not None:
             # Restore the normal background-first layout after updating only the dynamic slice.
@@ -282,7 +293,7 @@ class SceneTracker:
     def keyframe(self, views: list[View], log_path, focus: bool = False) -> dict:
         result = self.refine(views, log_path, self.cfg.v2_keyframe_iterations,
                              self.cfg.v2_keyframe_views_per_step, focus, densify=True,
-                             growth=self.cfg.v2_keyframe_growth)
+                             growth=self.cfg.v2_keyframe_growth, dynamic_only=self.cfg.v2_keyframe_dynamic_only)
         return {"keyframe_s": result.pop("refine_s"), "gaussians_before": result.pop("gaussians_before"),
                 "gaussians_after": result.pop("gaussians_after"), "keyframe_final_loss": result.pop("refine_final_loss")}
 
@@ -320,6 +331,7 @@ class SceneTracker:
         p = self.model.params; ids = p["instance_ids"].long()
         self.canon = {k: {n: v[ids == k].detach().clone() for n, v in p.items()} for k in self.person_ids}
         self.canon_ctrl = self.ctrl.pos.detach().clone()
+        self.n_canon, self.n_canon_dynamic = len(ids), int((ids != 0).sum())
 
     @torch.no_grad()
     def person_iou(self, cams: list[CameraFrame]) -> torch.Tensor:
