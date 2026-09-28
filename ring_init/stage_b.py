@@ -15,10 +15,11 @@ def source_view(cam) -> int:
 
 def _extract_job(args) -> tuple[int, int]:
     from ring_init.io.frames import ViewPreprocessor, extract_view
-    view, cfg_dict, out_dir, start, end, stride = args
+    view, cfg_dict, out_dir, start, end, stride, ext = args
     cfg = Config(**cfg_dict)
     pre = ViewPreprocessor(view, Path(cfg.distorted_cameras_txt), Path(cfg.distorted_images_txt), Path(cfg.eval_sparse), Path(cfg.photometric_json))
-    return view, extract_view(pre, Path(cfg.videos_dir) / f"view_{view:03d}.mp4", Path(out_dir), start, end, stride)
+    if cfg.frame_gpu_preprocess: pre.to_device(cfg.device)
+    return view, extract_view(pre, Path(cfg.videos_dir) / f"view_{view:03d}.mp4", Path(out_dir), start, end, stride, ext, cfg.frame_jpeg_quality)
 
 
 def step_frames(s: Scene, start: int, end: int) -> None:
@@ -29,10 +30,14 @@ def step_frames(s: Scene, start: int, end: int) -> None:
     for key in ("videos_dir", "distorted_cameras_txt", "distorted_images_txt", "photometric_json", "eval_sparse"):
         if not getattr(cfg, key): raise RuntimeError(f"config.{key} is required for Stage B frame extraction")
     t = time.time(); train_views = [source_view(c) for c in s.cameras]
-    jobs = [(v, asdict(cfg), str(s.out / "frames" / f"cam_{i:02d}"), start, end, 1) for i, v in enumerate(train_views)]
+    jobs = [(v, asdict(cfg), str(s.out / "frames" / f"cam_{i:02d}"), start, end, 1, cfg.frame_format) for i, v in enumerate(train_views)]
     heldout = [v for v in range(36) if v not in train_views]
-    jobs += [(v, asdict(cfg), str(s.out / "eval_frames" / f"view_{v:03d}"), start, end, cfg.eval_frame_stride) for v in heldout]
-    with ProcessPoolExecutor(cfg.frame_workers) as pool:
+    # Held-out frames are scoring targets, so they stay lossless whatever the training format.
+    jobs += [(v, asdict(cfg), str(s.out / "eval_frames" / f"view_{v:03d}"), start, end, cfg.eval_frame_stride, "png") for v in heldout]
+    # CUDA cannot be re-initialized in a forked child of this (CUDA-using) process.
+    import multiprocessing as mp
+    ctx = mp.get_context("spawn") if cfg.frame_gpu_preprocess else None
+    with ProcessPoolExecutor(cfg.frame_workers, mp_context=ctx) as pool:
         for view, n in pool.map(_extract_job, jobs): print(f"  frames view {view:03d}: {n} new")
     timings = json.loads(s.timings_path.read_text()) if s.timings_path.is_file() else {}
     timings["stage_b_frames"] = time.time() - t; s.timings_path.write_text(json.dumps(timings, indent=2) + "\n")
@@ -40,24 +45,67 @@ def step_frames(s: Scene, start: int, end: int) -> None:
 
 def frame_image(s: Scene, cam: int, frame: int) -> np.ndarray:
     import cv2
-    path = s.out / "frames" / f"cam_{cam:02d}" / f"{frame:06d}.png"
+    from ring_init.io.frames import frame_file
+    path = frame_file(s.out / "frames" / f"cam_{cam:02d}", frame)
     im = cv2.imread(str(path))
     if im is None: raise FileNotFoundError(path)
     return cv2.cvtColor(im, cv2.COLOR_BGR2RGB)
 
 
-def step_video_masks(s: Scene, start: int, end: int, name: str = "video_masks") -> None:
-    """Propagate the Stage A frame-0 instance labels through time per training camera."""
+def sam2_worker_count(requested: int, cameras: int, frames: int, available_bytes: int, image_size: int = 1024) -> int:
+    """Parallel SAM2 processes that fit in host memory. SAM2 buffers each camera's whole clip on
+    the CPU as float32 (frames x 3 x image_size^2); allow 25% plus 1.5 GiB per process on top."""
+    per_worker = frames * 3 * image_size ** 2 * 4 * 1.25 + 1.5 * 2 ** 30
+    return max(1, min(requested, cameras, int(available_bytes // per_worker)))
+
+
+def _available_memory() -> int:
+    for line in Path("/proc/meminfo").read_text().splitlines():
+        if line.startswith("MemAvailable:"): return int(line.split()[1]) * 1024
+    return 0
+
+
+_SAM2 = None
+
+
+def _init_sam2(config: str, checkpoint: str, device: str) -> None:
+    global _SAM2
     from sam2.build_sam import build_sam2_video_predictor
+    _SAM2 = build_sam2_video_predictor(config, checkpoint, device=device)
+
+
+def _mask_job(args) -> tuple[int, dict]:
     from ring_init.masks.video import propagate_camera
+    ci, frame_dir, frames, labels, out, min_area = args
+    return ci, propagate_camera(_SAM2, Path(frame_dir), frames, labels, Path(out), min_area)
+
+
+def step_video_masks(s: Scene, start: int, end: int, name: str = "video_masks") -> None:
+    """Propagate the Stage A frame-0 instance labels through time per training camera.
+    Cameras are independent, so up to ``sam2_workers`` processes propagate them concurrently."""
     cfg = s.cfg; d = s.dir(name); labels = s.labels(); frames = list(range(start, end)); report = {}
     if start != 0: raise ValueError("Mask propagation is prompted with the Stage A frame-0 labels; start must be 0.")
-    predictor = build_sam2_video_predictor(cfg.sam2_config, cfg.sam2_checkpoint, device=cfg.device)
+    jobs = []
     for ci in range(len(labels)):
         out = d / f"cam_{ci:02d}"
         if out.is_dir() and len(list(out.glob("*.png"))) >= len(frames) and "video_masks" not in s.force: continue
-        report[ci] = propagate_camera(predictor, s.out / "frames" / f"cam_{ci:02d}", frames, labels[ci], out, cfg.min_mask_area_px)
-        print(f"  video masks cam {ci:02d}: {report[ci]}")
+        jobs.append((ci, str(s.out / "frames" / f"cam_{ci:02d}"), frames, labels[ci], str(out), cfg.min_mask_area_px))
+    workers = sam2_worker_count(cfg.sam2_workers, len(jobs), len(frames), _available_memory()) if jobs else 0
+    t = time.time()
+    if workers > 1:
+        import multiprocessing as mp
+        print(f"  video masks: {len(jobs)} cameras on {workers} SAM2 processes")
+        with ProcessPoolExecutor(workers, mp_context=mp.get_context("spawn"), initializer=_init_sam2,
+                                 initargs=(cfg.sam2_config, cfg.sam2_checkpoint, cfg.device)) as pool:
+            for ci, r in pool.map(_mask_job, jobs):
+                report[ci] = r; print(f"  video masks cam {ci:02d}: {r}")
+    elif jobs:
+        _init_sam2(cfg.sam2_config, cfg.sam2_checkpoint, cfg.device)
+        for job in jobs:
+            ci, r = _mask_job(job); report[ci] = r; print(f"  video masks cam {ci:02d}: {r}")
+    if jobs:
+        timings = json.loads(s.timings_path.read_text()) if s.timings_path.is_file() else {}
+        timings["stage_b_video_masks"] = time.time() - t; s.timings_path.write_text(json.dumps(timings, indent=2) + "\n")
     prev = json.loads((d / "report.json").read_text()) if (d / "report.json").is_file() else {}
     prev.update({str(k): v for k, v in report.items()}); (d / "report.json").write_text(json.dumps(prev, indent=2) + "\n")
 

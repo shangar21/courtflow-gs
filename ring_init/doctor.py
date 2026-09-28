@@ -17,9 +17,28 @@ import sys
 import torch
 
 
+def _check_gsplat() -> None:
+    """Force gsplat's JIT build (source wheels compile on first use) with one tiny render.
+
+    Its host ``.cpp`` files are built by the plain C++ compiler, which needs ``CUDA_HOME`` or
+    ``CPATH`` to locate ``cuda_runtime.h`` in Conda-packaged CUDA toolkits.
+    """
+    from gsplat import rasterization
+    d, n = "cuda", 256
+    means = torch.randn(n, 3, device=d) + torch.tensor([0.0, 0.0, 5.0], device=d)
+    quats = torch.nn.functional.normalize(torch.randn(n, 4, device=d), dim=-1)
+    colors = torch.rand(n, 3, device=d, requires_grad=True)
+    K = torch.tensor([[[100.0, 0, 32], [0, 100.0, 32], [0, 0, 1]]], device=d)
+    img, _, _ = rasterization(means, quats, torch.full((n, 3), 0.05, device=d), torch.full((n,), 0.8, device=d),
+                              colors, torch.eye(4, device=d)[None], K, 64, 64)
+    img.sum().backward()
+    if colors.grad is None or not torch.isfinite(colors.grad).all():
+        raise SystemExit("gsplat rendered but produced no finite colour gradient.")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--compile", action="store_true", help="JIT-build fused MLS and fused SSIM for this GPU")
+    ap.add_argument("--compile", action="store_true", help="JIT-build fused MLS, fused SSIM, and gsplat for this GPU")
     args = ap.parse_args()
     print(f"Python: {sys.version.split()[0]}")
     print(f"PyTorch: {torch.__version__}; CUDA runtime: {torch.version.cuda}")
@@ -37,6 +56,8 @@ def main() -> None:
         from ring_init.gs import fused_ssim
         mls.load_extension(verbose=True); fused_ssim.load_extension(verbose=True)
         print("Fused MLS and SSIM extensions compiled successfully.")
+        _check_gsplat()
+        print("gsplat rasterizer compiled and passed a forward/backward render.")
     else:
         print("GPU preflight passed. Run with --compile to prewarm custom CUDA extensions.")
 

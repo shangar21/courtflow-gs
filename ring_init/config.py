@@ -5,6 +5,13 @@ from pathlib import Path
 import json
 
 
+# Full-image and tracking-image pixel lengths; both grids scale with capture_scale.
+PIXEL_LENGTH_FIELDS = ("instance_box_padding_px", "crop_min_size_px", "reprojection_px", "occluder_splat_px",
+                       "mask_prune_dilate_px", "crop_render_padding_px", "bg_person_mask_dilation_px",
+                       "v2_keyframe_focus_pad_px", "ball_crop_px", "ball_reproj_px",
+                       "tracking_loss_margin_px", "tracking_box_margin_px")
+
+
 @dataclass
 class Config:
     """Every threshold of the pipeline. Metric lengths are in meters and converted to scene
@@ -117,11 +124,16 @@ class Config:
     bg_person_mask_dilation_px: int = 2
     bg_composite_persons: bool = True             # frozen person models rendered in front during bg training
     # Stage B frame data (reproduces the frame-0 preprocessing).
+    capture_scale: float = 0.5                    # raw 4K capture decode scale (0.5 -> 1920x1080); pixel params are tuned at 0.5
     videos_dir: str | None = None                 # cameras/view_XXX.mp4
     distorted_cameras_txt: str | None = None      # COLMAP OPENCV intrinsics of the 1080p frames
     distorted_images_txt: str | None = None
     photometric_json: str | None = None
     frame_workers: int = 6
+    frame_format: str = "png"                     # training frames: png (lossless) | jpg (~18x faster writes; for 4K capture)
+    frame_jpeg_quality: int = 95
+    frame_gpu_preprocess: bool = False            # undistortion + colour table on the GPU in the extraction workers
+    sam2_workers: int = 1                         # cameras propagated concurrently by SAM2 (capped by host memory)
     eval_frame_stride: int = 10                   # held-out cameras decoded/evaluated every N frames
     # Stage B v2 (QuickCapture-style whole-scene deformation + keyframe retraining).
     stage_b_mode: str = "scene"                  # scene (v2) | persons (v1: persons only, frozen background)
@@ -235,8 +247,20 @@ class Config:
             raise ValueError("drop_gaussian_rate must be in [0, 1).")
         if self.gaussian_control_knn < 3:
             raise ValueError("gaussian_control_knn must be at least 3 for rigid MLS.")
+        if self.frame_format not in ("png", "jpg"):
+            raise ValueError("frame_format must be 'png' or 'jpg'.")
         if self.sh_degree not in (0, 1):
             raise ValueError("sh_degree must be 0 or 1 (higher degrees overfit with 12 views).")
+
+    def rescale_pixel_params(self, reference_scale: float = 0.5) -> None:
+        """Keep image-pixel thresholds at the same physical footprint when ``capture_scale``
+        differs from the resolution they were tuned at. Call once on a freshly loaded config."""
+        f = self.capture_scale / reference_scale
+        if f == 1: return
+        for name in PIXEL_LENGTH_FIELDS:
+            value = getattr(self, name)
+            setattr(self, name, type(value)(round(value * f)) if isinstance(value, int) else value * f)
+        self.min_mask_area_px = int(round(self.min_mask_area_px * f * f))
 
     def m(self, meters: float) -> float:
         """Convert a metric length to scene units."""

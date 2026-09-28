@@ -1,7 +1,7 @@
 """Adapt a raw ``cameras/`` + ``calibration/`` capture into CourtFlow-GS inputs.
 
 The raw layout contains 36 synchronized 4K MP4 files and COLMAP text calibration with OPENCV
-distortion.  This module creates a reproducible, half-resolution pinhole working set: the 12
+distortion.  This module creates a reproducible pinhole working set (half resolution by default): the 12
 ring training images, all-view pinhole calibration for tracking/evaluation, identity photometric
 metadata, and frame-0 images for held-out evaluation.
 """
@@ -54,6 +54,8 @@ def prepare(dataset_dir: str | Path, work_root: str | Path, scene: str, scale: f
     all_pinhole = [_pinhole(c, scale) for c in raw]
     stage = root / "prepared_input" / scene; images, eval_images = stage / "images", stage / "eval_images"
     marker = stage / "prepared.json"
+    if marker.is_file() and json.loads(marker.read_text()).get("scale") != scale:
+        raise RuntimeError(f"{stage} was prepared at a different scale; use a separate --out-dir per capture scale")
     if not marker.is_file():
         images.mkdir(parents=True, exist_ok=True); eval_images.mkdir(parents=True, exist_ok=True)
         for view, (src, dst) in enumerate(zip(raw, all_pinhole)):

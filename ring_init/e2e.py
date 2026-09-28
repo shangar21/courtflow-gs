@@ -53,11 +53,12 @@ def main() -> None:
     args = ap.parse_args()
 
     cfg = Config.load(args.config)
+    cfg.rescale_pixel_params()  # no-op at the default half-resolution capture scale
     base = Path(args.dataset_dir or args.train_dir).resolve()
     cfg.out_root = str(Path(args.out_dir).resolve()) if args.out_dir else str(base / "ring_dynamic_outputs")
     if args.dataset_dir:
         from ring_init.bootstrap import prepare
-        prepared = prepare(base, cfg.out_root, args.scene)
+        prepared = prepare(base, cfg.out_root, args.scene, cfg.capture_scale)
         for key, value in prepared.items(): setattr(cfg, key, value)
         cfg.calibration = "calibration.json"
     else:

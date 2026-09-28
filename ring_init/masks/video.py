@@ -9,6 +9,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import torch
+from ring_init.io.frames import frame_file
 
 
 def propagate_camera(predictor, png_dir: Path, frames: list[int], frame0_labels: np.ndarray, out_dir: Path, min_area_px: int) -> dict:
@@ -19,8 +20,12 @@ def propagate_camera(predictor, png_dir: Path, frames: list[int], frame0_labels:
     tmp = Path(tempfile.mkdtemp(prefix="sam2_jpg_"))
     try:
         for i, f in enumerate(frames):  # SAM2 reads "<index>.jpg" folders
-            im = cv2.imread(str(png_dir / f"{f:06d}.png"))
-            if im is None: raise FileNotFoundError(png_dir / f"{f:06d}.png")
+            src = frame_file(png_dir, f)
+            if src.suffix == ".jpg":   # already JPEG: link instead of re-encoding
+                if not src.is_file(): raise FileNotFoundError(src)
+                (tmp / f"{i:05d}.jpg").symlink_to(src.resolve()); continue
+            im = cv2.imread(str(src))
+            if im is None: raise FileNotFoundError(src)
             cv2.imwrite(str(tmp / f"{i:05d}.jpg"), im, [cv2.IMWRITE_JPEG_QUALITY, 95])
         t0 = time.time()
         with torch.inference_mode(), torch.autocast("cuda", dtype=torch.bfloat16):
