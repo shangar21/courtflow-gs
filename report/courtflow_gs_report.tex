@@ -4,7 +4,6 @@
 \usepackage{mathptmx} % Times New Roman-compatible text and mathematics
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
 \newcommand{\method}{\textsc{CourtFlow-GS}\xspace}
-\newcommand{\pro}{\textcolor{red}{[measure on RTX PRO 6000]}}
 \title{\method: Online Multi-View Dynamic Gaussian Reconstruction with Fused MLS Tracking}
 \author{Shangar Muhunthan}
 \date{\today}
@@ -34,7 +33,7 @@ only lightly updated.
 \item \textbf{The results.} On one RTX PRO 6000 at $1920\times1080$, the whole game takes about two
 hours from raw videos to finished novel-view videos. The unseen cameras score 20.4~dB PSNR on average
 over all 700 frames. A strong existing method, ClipGStream, scored 17.2--17.9~dB on the same cameras,
-and only on the first 10 frames. A new view renders in 2--3~ms, over 300 frames per second even at 4K.
+and only on the first 10 frames. A new view renders in 3--4~ms, over 250 frames per second even at 4K.
 \item \textbf{What we learned.} Longer training made the existing method \emph{worse} on unseen
 cameras, which shows it memorizes the 12 views. Our first full 700-frame run revealed that the scene
 kept growing until it fell apart, and capping its size made it faster, smaller and better at the same
@@ -359,7 +358,7 @@ and improve either player crops or a periodic full keyframe.
 \end{algorithmic}
 \end{algorithm}
 
-\section{Execution Walkthrough}
+\section{Execution Walkthrough}\label{sec:walkthrough}
 The previous section explains \emph{why} each part of the method exists. This section follows one
 complete run from the raw capture to the final videos: which program runs, what it reads, what it
 writes, and where time is spent. Everything is started by a single command,
@@ -603,8 +602,56 @@ right: render). \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images a
 \end{figure}
 
 \subsection{Results at native 4K}\label{sec:4k}
-\textcolor{red}{[4K 700-frame run in progress; results, videos, and the 1080p versus 4K comparison
-are added when it finishes.]}
+The same pipeline also runs on the full $3840\times2160$ images. At 4K, the frame-0 build, keyframes,
+refinement, test scoring and videos all use native resolution, while the control points are fitted on
+$1920\times1080$ renders. Every threshold measured in pixels is doubled so it covers the same part of
+the scene. Data preparation uses the faster path from Section~\ref{sec:walkthrough}: JPEG frames,
+undistortion on the GPU, and SAM2 running on four cameras at once.
+
+\begin{table}[H]\centering
+\caption{End-to-end time at native 4K. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test
+images at $3840\times2160$; 700 frames; 1.2 million-Gaussian budget; the GPU was not shared.}\label{tab:e2e-4k}
+\small\begin{tabular}{lr}\toprule
+Step & Wall-clock time \\\midrule
+Stage A: build the frame-0 scene & 17.7 min \\
+Decode 700 frames (JPEG, GPU undistortion) & 9.5 min \\
+SAM2 player masks, four cameras at once & 15.8 min \\
+Score frame 0, track the ball, load the scene & 12.3 min \\
+Track players and refine, 700 frames & 95.6 min \\\midrule
+\textbf{Total} & \textbf{$\approx$ 151 min} \\\bottomrule
+\end{tabular}\end{table}
+Tracking costs 7.1~s per frame, about 1.7 times the 1080p cost. The faster data path pays off:
+decoding four times as many pixels took 9.5~minutes, against 11.2 at 1080p on the old path, and SAM2
+took 15.8 instead of 31.2~minutes. Peak GPU memory was 47.8~GB while four SAM2 processes and the GPU
+decoder ran together, and 12.5~GB during tracking.
+
+Scores measured at 4K are not comparable with scores measured at 1080p, because a sharper target is
+harder to match. For a fair comparison, Table~\ref{tab:fair4k} draws every final model from the same
+24 test cameras at $1920\times1080$ and scores it against the same images.
+\begin{table}[H]\centering
+\caption{1080p versus 4K training, scored on identical test images. \textbf{Setup:} RTX PRO 6000; each
+model drawn at $1920\times1080$ from the 24 test cameras at every 50th frame (13 frames) and compared
+with the same $1920\times1080$ images.}\label{tab:fair4k}
+\small\begin{tabular}{lrrrr}\toprule
+Model & PSNR & SSIM & LPIPS & End-to-end time \\\midrule
+\textbf{Trained at 1080p, 2M cap (final)} & \textbf{20.44} & \textbf{0.689} & \textbf{0.230} & \textbf{$\approx$ 119 min} \\
+Trained at 4K, 1.2M cap & 19.74 & 0.663 & 0.253 & $\approx$ 151 min \\
+Trained at 4K, 3M cap & 19.30 & 0.655 & 0.265 & -- \\\bottomrule
+\end{tabular}\end{table}
+Training at 4K was both slower and worse on new views. The larger images show finer detail, but
+still from the same 12 viewpoints, so the extra detail is mostly fitted to those views and does not
+carry over to new ones. A larger budget did not help: as at 1080p, 3 million Gaussians brought back
+floaters, and the 4K 3 million model fell to 18.3~dB at frame 650. The 4K settings were not tuned
+beyond doubling the pixel thresholds, so 4K might do better with its own tuning, but on this evidence
+the half-resolution working copy is the better choice on both speed and quality. The native-resolution
+renders do show that the static scene holds real 4K detail (Figure~\ref{fig:4kcrop}).
+\begin{figure}[H]\centering
+\includegraphics[width=\linewidth]{figures/4k_native_crop_f300_f650.jpg}
+\caption{A $1920\times1080$ crop of the native 4K render from test camera 13 at frames 300 (left) and
+650 (right). Crowd faces, the scoreboard and the court lettering are sharp; late in the game, players
+in the crowded play under the basket are ghosted. \textbf{Setup:} RTX PRO 6000; trained at
+$3840\times2160$ with a 1.2 million-Gaussian budget.}\label{fig:4kcrop}
+\end{figure}
 
 \subsection{Earlier development results}
 Table~\ref{tab:dev} records how the method improved during development on the RTX 3080, before the
@@ -695,7 +742,8 @@ the faster data path (JPEG frames, GPU undistortion, and SAM2 on four cameras at
 4K run.
 
 \paragraph{Novel-view rendering (inference).} Drawing a tracked frame from a new camera takes about
-2--3~ms on the RTX PRO 6000, even at 4K; Section~\ref{sec:inference} covers inference in detail.
+3.0~ms at 1080p and 3.8~ms at 4K for the final 2 million-Gaussian scene on the RTX PRO 6000;
+Section~\ref{sec:inference} covers inference in detail.
 
 \subsection{RTX 3080 versus RTX PRO 6000}
 \begin{table}[H]\centering
@@ -746,9 +794,10 @@ Step & Scene & Time per frame \\\midrule
 Bake (move all Gaussians with 15{,}352 control points) & 2.0M Gaussians & 0.9--2.2 ms \\
 Draw at $1920\times1080$ & 1.10M Gaussians & 2.20 ms (455 FPS) \\
 Draw at $3840\times2160$ & 1.10M Gaussians & 2.94 ms (341 FPS) \\
-Draw at $1920\times1080$ and $3840\times2160$ & 2.0M Gaussians & \textcolor{red}{[pending]} \\\bottomrule
+Draw at $1920\times1080$ & 2.0M Gaussians (final) & 2.96 ms (338 FPS) \\
+Draw at $3840\times2160$ & 2.0M Gaussians (final) & 3.82 ms (262 FPS) \\\bottomrule
 \end{tabular}\end{table}
-Baking plus drawing therefore takes about 3--5~ms, which is well above real time: the video itself
+Baking plus drawing the final scene therefore takes about 4--6~ms, far faster than real time: the video itself
 runs at 25 frames per second (40~ms per frame).
 
 \subsection{What has to be stored}
