@@ -164,6 +164,8 @@ class Config:
     v2_keyframe_growth: float = 0.05              # max Gaussian growth per keyframe
     v2_growth_cap: float = 0.5                    # total size <= frame-0 size x (1 + cap); 0 = uncapped (compounds ~30x over 700 frames)
     v2_keyframe_dynamic_only: bool = False        # keyframes train only players/ball; the frame-0 background stays frozen
+    v2_max_gaussians: int = 0                     # >0: absolute cap on the total Gaussian count (with or instead of v2_growth_cap)
+    v2_save_state_every: int = 50                 # full tracker checkpoint (resumable with run.py --resume-from TAG:FRAME)
     selective_adam: bool = True                   # keyframe/background training: update only visible Gaussians
     v2_prefetch: bool = True                      # load frame f+1 on a background thread while tracking frame f
     v2_dynamic_only_deform: bool = True           # rasterize only persons/ball during deformation over a cached background

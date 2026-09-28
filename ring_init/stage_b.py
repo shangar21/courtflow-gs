@@ -313,6 +313,9 @@ class _VideoWriter:
         self.proc = subprocess.Popen(["ffmpeg", "-v", "error", "-y", "-f", "rawvideo", "-pix_fmt", "rgb24", "-s", f"{width}x{height}", "-r", str(fps), "-i", "-",
                                       "-c:v", "libx264", "-pix_fmt", "yuv420p", "-crf", "18", str(path)], stdin=subprocess.PIPE)
 
+    def write_bytes(self, rgb: np.ndarray) -> None:
+        self.proc.stdin.write(np.ascontiguousarray(rgb, np.uint8).tobytes())
+
     def write(self, rgb) -> None:
         import torch
         img = torch.nn.functional.interpolate(rgb.permute(2, 0, 1)[None], size=(self.size[1], self.size[0]), mode="area")[0].permute(1, 2, 0)
@@ -320,6 +323,20 @@ class _VideoWriter:
 
     def close(self) -> None:
         self.proc.stdin.close(); self.proc.wait()
+
+
+def _decode_video(path: Path, count: int, width: int, height: int):
+    """First `count` RGB frames of an encoded video, which must be `width` x `height`."""
+    import subprocess
+    proc = subprocess.Popen(["ffmpeg", "-v", "error", "-i", str(path), "-frames:v", str(count), "-f", "rawvideo", "-pix_fmt", "rgb24", "-"], stdout=subprocess.PIPE)
+    size = width * height * 3
+    try:
+        for i in range(count):
+            buf = proc.stdout.read(size)
+            if len(buf) < size: raise RuntimeError(f"{path}: only {i} of {count} frames at {width}x{height}")
+            yield np.frombuffer(buf, np.uint8).reshape(height, width, 3)
+    finally:
+        proc.stdout.close(); proc.wait()
 
 
 def _full_view(cam, img, device: str):
@@ -370,17 +387,29 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
     oc0 = _camera_frame(orbit[0], None, dev, cfg.v2_video_scale); writers["orbit"] = _VideoWriter(d / "videos" / "orbit360.mp4", oc0.width // 2 * 2, oc0.height // 2 * 2)
     positions = [ctrl.pos.cpu().numpy()]; metrics = []; refiner = None; repair = None; boost = torch.ones(len(person_ids), device=dev)
     frame0_ids = [int(k) for k in np.unique(np.concatenate([np.unique(l) for l in frame0])) if k > 0]
-    if resume_from is not None:   # restart from a saved state of another run (same controls/canonical)
-        from ring_init.deform.control_points import bind_gaussians
-        from ring_init.gs.export import load_ply
-        src = s.out / resume_from[0]; rf = resume_from[1]
-        st = load_ply(src / "ply" / f"frame_{rf:06d}" / "point_cloud.ply", dev)
-        for n in list(tracker.model.params.keys()): tracker.model.params[n] = torch.nn.Parameter(st.params[n].detach().clone(), requires_grad=n != "instance_ids")
-        P = np.load(src / "control_positions.npz")["pos"]
-        tracker.ctrl.pos = torch.as_tensor(P[rf], device=dev); tracker.history = [torch.as_tensor(P[j], device=dev) for j in (rf - 2, rf - 1, rf)]
-        tracker.ctrl.nbr, tracker.ctrl.w = bind_gaussians(tracker.model.params["means"], tracker.model.params["instance_ids"].long(), tracker.ctrl.pos, tracker.ctrl.group, tracker.ctrl.sigma, cfg.gaussian_control_knn)
-        tracker._refresh_onehot(); positions = [tracker.ctrl.pos.cpu().numpy()]; start = rf
-        orbit = orbit_cameras(s.cameras, end - start, 360.0); print(f"  resumed from {src.name} frame {rf}")
+    resume_frame = None
+    if resume_from is not None:
+        # Continue from another run's full checkpoint (same canonical scene and controls). Frame
+        # numbering, mask/keyframe cadence and the orbit path stay tied to `start`, so the resumed
+        # run schedules exactly the same frames as an uninterrupted one.
+        src = s.out / resume_from[0]; resume_frame = int(resume_from[1])
+        st = torch.load(src / "state" / f"frame_{resume_frame:06d}.pt", map_location="cpu", weights_only=False)
+        if st["frame"] != resume_frame or st["start"] != start: raise ValueError(f"checkpoint {st['frame']}/{st['start']} does not match resume {resume_frame}/{start}")
+        tracker.restore_state(st["tracker"]); boost = st["boost"].to(dev)
+        if st["repair"] is not None:
+            from ring_init.masks.reassociate import IdentityRepair
+            repair = IdentityRepair(s, cfg, [k for k in person_ids if k in set(frame0_ids)])
+            repair.ref_pos, repair.ref_hist = st["repair"]["ref_pos"], st["repair"]["ref_hist"]
+        positions = list(np.load(src / "control_positions.npz")["pos"][: resume_frame - start + 1])
+        metrics = [m for m in json.loads((src / "metrics.json").read_text())["frames"] if m["frame"] <= resume_frame]
+        if len(positions) != resume_frame - start + 1: raise ValueError("source control_positions.npz ends before the checkpoint")
+        (d / "resumed_from.json").write_text(json.dumps({"source": resume_from[0], "frame": resume_frame}) + "\n")
+        print(f"  resumed from {src.name} frame {resume_frame} ({len(tracker.model)} Gaussians)")
+
+    def save_state(f: int) -> None:
+        torch.save({"frame": f, "start": start, "tracker": tracker.checkpoint_state(), "boost": boost.cpu(),
+                    "repair": None if repair is None else {"ref_pos": repair.ref_pos, "ref_hist": repair.ref_hist}},
+                   s.dir(f"{tag}/state") / f"frame_{f:06d}.pt")
 
     def write_videos(f: int) -> None:
         with torch.no_grad():
@@ -401,8 +430,12 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
         return full, small, labs
 
     if cfg.v2_dynamic_only_deform: tracker.cache_background(cams)
-    write_videos(start)
-    for f in range(start + 1, end):
+    if resume_frame is None: write_videos(start)
+    else:   # copy the source run's frames start..resume_frame so the videos cover the whole range
+        for key, w in writers.items():
+            name = "orbit360.mp4" if key == "orbit" else f"heldout_view{key:02d}.mp4"
+            for rgb in _decode_video(s.out / resume_from[0] / "videos" / name, resume_frame - start + 1, *w.size): w.write_bytes(rgb)
+    for f in range((start if resume_frame is None else resume_frame) + 1, end):
         a = time.time(); mask_frame = cfg.v2_mask_every <= 0 or (f - start) % cfg.v2_mask_every == 0
         full_imgs, small, labs = (loader.pop(f).result() if f in loader else load_frame(f))
         if cfg.v2_prefetch and f + 1 < end: loader[f + 1] = pool.submit(load_frame, f + 1)   # overlaps with GPU work
@@ -488,9 +521,11 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
             print(f"    eval frame {f}: {json.dumps({k: round(v, 3) for k, v in info['eval'].items()})}")
         metrics.append(info)
         if (f - start) % cfg.v2_save_ply_every == 0: save_ply(tracker.model, d / "ply" / f"frame_{f:06d}" / "point_cloud.ply")
-        if f % 25 == 0 or f == end - 1:
+        save_now = cfg.v2_save_state_every > 0 and (f - start) % cfg.v2_save_state_every == 0
+        if f % 25 == 0 or f == end - 1 or save_now:
             np.savez_compressed(d / "control_positions.npz", pos=np.stack(positions), group=ctrl.group.cpu().numpy(), frames=np.arange(start, start + len(positions)))
             (d / "metrics.json").write_text(json.dumps({"setup_s": setup_s, "frames": metrics}, indent=2, default=float) + "\n")
+        if save_now: save_state(f)
     pool.shutdown(wait=False)
     for w in writers.values(): w.close()
     save_ply(tracker.model, d / "ply" / f"frame_{end - 1:06d}" / "point_cloud.ply")

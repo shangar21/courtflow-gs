@@ -24,7 +24,8 @@ def stage_a(scene: str, cfg: Config, force: set[str], until: str | None, evaluat
         run_eval(scene, cfg)
 
 
-def stage_b(scene: str, cfg: Config, frames: str, force: set[str], exclude: tuple[int, ...] = (), tag: str | None = None) -> None:
+def stage_b(scene: str, cfg: Config, frames: str, force: set[str], exclude: tuple[int, ...] = (), tag: str | None = None,
+            resume_from: tuple[str, int] | None = None) -> None:
     """Online tracking of the frozen Stage A canonical models over `frames` (START:END, START = 0)."""
     from ring_init.stage_b import step_frames, step_track, step_track_scene, step_video_masks
     canonical = Path(cfg.out_root) / scene / "canonical" / "manifest.json"
@@ -38,7 +39,7 @@ def stage_b(scene: str, cfg: Config, frames: str, force: set[str], exclude: tupl
             from ring_init.ball import step_ball_canonical, track_ball
             if not (s.out / "ball" / "trajectory.npz").is_file() or "ball" in force: track_ball(s, start, end)
             if not (s.out / "canonical_ball" / "manifest.json").is_file() or "ball" in force: step_ball_canonical(s)
-        step_track_scene(s, start, end, tag=tag or "stage_b_v2")
+        step_track_scene(s, start, end, tag=tag or "stage_b_v2", resume_from=resume_from)
     else: step_track(s, start, end, exclude_cameras=exclude)
 
 
@@ -50,6 +51,7 @@ def main() -> None:
     parser.add_argument("--tag", help="Stage-B output directory name; use this to preserve prior runs")
     parser.add_argument("--set", dest="overrides", action="append", default=[], metavar="KEY=VALUE",
                         help="override a config field for this run; VALUE may be JSON or a bare string")
+    parser.add_argument("--resume-from", metavar="TAG:FRAME", help="Stage B: continue from another run's full checkpoint (use a new --tag)")
     parser.add_argument("--until", default=None, help="stop after this step")
     parser.add_argument("--no-eval", action="store_true", help="skip held-out evaluation")
     args = parser.parse_args(); cfg = Config.load(args.config)
@@ -63,7 +65,13 @@ def main() -> None:
         setattr(cfg, key, tuple(value) if key in {"heldout_cameras", "eval_training_views", "v2_video_views"} and isinstance(value, list) else value)
     cfg.validate()
     if args.stage in ("a", "both"): stage_a(args.scene, cfg, {x for x in args.force.split(",") if x}, args.until, not args.no_eval)
-    if args.stage in ("b", "both"): stage_b(args.scene, cfg, args.frames, {x for x in args.force.split(",") if x}, tag=args.tag)
+    resume = None
+    if args.resume_from:
+        src, sep, frame = args.resume_from.rpartition(":")
+        if not sep or not frame.isdigit(): parser.error("--resume-from must be TAG:FRAME")
+        if not args.tag or args.tag == src: parser.error("--resume-from needs a new --tag so the source run is not overwritten")
+        resume = (src, int(frame))
+    if args.stage in ("b", "both"): stage_b(args.scene, cfg, args.frames, {x for x in args.force.split(",") if x}, tag=args.tag, resume_from=resume)
 
 
 if __name__ == "__main__":

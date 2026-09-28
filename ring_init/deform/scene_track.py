@@ -22,14 +22,16 @@ from ring_init.deform.track import CameraFrame, eval_colors
 from ring_init.gs.train import GaussianModel, View, ssim_map, train_gaussians
 
 
-def densify_cap(n_trained: int, growth: float, base: int, cap: float) -> int:
+def densify_cap(n_trained: int, growth: float, base: int, cap: float, max_total: int = 0) -> int:
     """Maximum size of the trained model after one densifying refinement.
 
-    ``growth`` limits a single keyframe relative to the current size. Without ``cap`` that limit
-    compounds (70 keyframes at 5% allow ~30x). ``cap > 0`` also bounds the total at
-    ``base * (1 + cap)``, where ``base`` is the same group's frame-0 size; it never forces pruning."""
+    ``growth`` limits a single keyframe relative to the current size. Without a cap that limit
+    compounds (70 keyframes at 5% allow ~30x). ``cap > 0`` bounds the total at ``base * (1 + cap)``,
+    where ``base`` is the same group's frame-0 size; ``max_total > 0`` bounds it at an absolute
+    Gaussian count. Neither ever forces pruning."""
     limit = int(n_trained * (1 + growth))
     if cap > 0: limit = min(limit, max(int(base * (1 + cap)), n_trained))
+    if max_total > 0: limit = min(limit, max(max_total, n_trained))
     return limit
 
 
@@ -278,7 +280,8 @@ class SceneTracker:
                        t0_lr_means=c.v2_keyframe_lr_means, t0_lr_means_final_factor=1.0, drop_gaussian=False, depth_weight=0.0,
                        densify_start_iter=c.v2_keyframe_densify_start if densify else iterations + 1,
                        densify_every=c.v2_keyframe_densify_every, densify_until_fraction=c.v2_keyframe_densify_until if densify else 0.0,
-                       bg_max_gaussians=densify_cap(len(trained), growth, base, c.v2_growth_cap))
+                       bg_max_gaussians=densify_cap(len(trained), growth, base, c.v2_growth_cap,
+                                                    max(c.v2_max_gaussians - len(frozen), 1) if frozen is not None and c.v2_max_gaussians > 0 else c.v2_max_gaussians))
         stats = train_gaussians(trained, views, kcfg, "background", log_path, frozen=frozen)
         if frozen is not None:
             # Restore the normal background-first layout after updating only the dynamic slice.
@@ -324,6 +327,23 @@ class SceneTracker:
                 lab = torch.where(best.values >= 0, self.ids_t[torch.as_tensor(cols, device=lab.device)][best.indices], lab)
             labels.append(lab)
         return labels
+
+    # ------------------------------------------------------------------ checkpoints
+    def checkpoint_state(self) -> dict:
+        """Everything the tracker changes while running; the rest is rebuilt from the canonical scene."""
+        return {"params": {k: v.detach().cpu() for k, v in self.model.params.items()},
+                "ctrl": {k: getattr(self.ctrl, k).detach().cpu() for k in ("pos", "nbr", "w")},
+                "history": [h.detach().cpu() for h in self.history],
+                "gen": self.gen.get_state(), "cam_cycle": list(self.cam_cycle)}
+
+    def restore_state(self, state: dict) -> None:
+        from ring_init.gs.train import PARAM_KEYS
+        dev = self.ctrl.pos.device; p = state["params"]
+        self.model = GaussianModel({k: p[k].to(dev) for k in PARAM_KEYS}, p["instance_ids"].to(dev))
+        for k, v in state["ctrl"].items(): setattr(self.ctrl, k, v.to(dev))
+        self.history = [h.to(dev) for h in state["history"]]
+        self.gen.set_state(state["gen"]); self.cam_cycle = list(state["cam_cycle"])
+        self._refresh_onehot()
 
     # ------------------------------------------------------------------ recovery
     def remember_canonical(self) -> None:
