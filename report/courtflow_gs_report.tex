@@ -322,13 +322,13 @@ the table then gives the average over those frames $\pm$ how much it varies from
 \caption{Final quality on the 24 test cameras. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The frame-0 row
 scores the starting scene alone; its player score uses a different player-region definition, so it
 is not shown.}\label{tab:final-quality}
-\small\begin{tabular}{lrrrr}\toprule
-Result & PSNR & SSIM & LPIPS & Player PSNR \\\midrule
-Frame-0 scene (Stage A) & 20.08 & 0.679 & 0.229 & -- \\
-\textbf{Whole video, final method (2M cap)} & \textbf{20.43 $\pm$ 0.45} & \textbf{0.689 $\pm$ 0.016} & \textbf{0.230 $\pm$ 0.013} & \textbf{23.02 $\pm$ 1.89} \\
-\quad first half (frames 0--349) & 20.84 & -- & -- & 24.30 \\
-\quad second half (frames 350--699) & 20.03 & -- & -- & 21.78 \\
-Whole video, before the growth fix & 19.34 $\pm$ 1.49 & 0.675 $\pm$ 0.035 & 0.243 $\pm$ 0.031 & 23.70 $\pm$ 1.64 \\\bottomrule
+\scriptsize\begin{tabular}{lrrrrr}\toprule
+Result & Test PSNR & Train PSNR & SSIM & LPIPS & Player PSNR \\\midrule
+Frame-0 scene (Stage A) & 20.08 & -- & 0.679 & 0.229 & -- \\
+\textbf{Whole video, final method (2M cap)} & \textbf{20.43 $\pm$ 0.45} & \textbf{29.10 $\pm$ 1.98} & \textbf{0.689 $\pm$ 0.016} & \textbf{0.230 $\pm$ 0.013} & \textbf{23.02 $\pm$ 1.89} \\
+\quad first half (frames 0--349) & 20.84 & 27.94 & -- & -- & 24.30 \\
+\quad second half (frames 350--699) & 20.03 & 22.32 & -- & -- & 21.78 \\
+Whole video, before the growth fix & 19.34 $\pm$ 1.49 & -- & 0.675 $\pm$ 0.035 & 0.243 $\pm$ 0.031 & 23.70 $\pm$ 1.64 \\\bottomrule
 \end{tabular}\end{table}
 
 For comparison, ClipGStream reached 17.2--17.9~dB on the same 24 test cameras
@@ -553,7 +553,7 @@ runs at 25 frames per second (40~ms per frame).
 The release playback path is deliberately forward-only: it reads pre-exported Gaussian parameters,
 evaluates view-dependent colour, and rasterizes. It does not load SAM2, MASt3R, a detector, an
 optimizer, or the tracking code. During a tracking run, pass
-	exttt{--set v2\_export\_playback=true} to write a package with one dynamic Gaussian file per
+\texttt{--set v2\_export\_playback=true} to write a package with one dynamic Gaussian file per
 frame and a background file at each keyframe. A viewer
 can then render an unseen physical camera or benchmark the draw path with:
 \begin{verbatim}
