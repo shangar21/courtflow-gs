@@ -80,8 +80,9 @@ longer made the test score \emph{worse} (17.88~dB after 6000 steps, 17.53~dB aft
 though the training score went up: the model was memorizing the 12 views rather than learning the
 3D scene. It also took about 13.5~s per frame on the 3080, after a 7.2~minute start-up.
 \begin{table}[H]\centering
-\caption{ClipGStream on this capture: 12 training cameras, averaged over the 24 test cameras
-(RTX 3080, $960\times540$). PSNR and SSIM: higher is better. LPIPS: lower is better.}\label{tab:clipgstream}
+\caption{ClipGStream on this capture. \textbf{Setup:} RTX 3080 (12 GB); $960\times540$ (the 4K capture
+quartered); 12 training cameras; scores averaged over the 24 test cameras on the first 10 video frames.
+PSNR and SSIM: higher is better. LPIPS: lower is better.}\label{tab:clipgstream}
 \small\begin{tabular}{lrrrr}\toprule
 Run & Training PSNR & Test PSNR & Test SSIM & Test LPIPS \\\midrule
 6000 steps & 25.96 & 17.88 & 0.543 & 0.308 \\
@@ -357,7 +358,7 @@ frame-0 images are kept for held-out evaluation. The adapter also writes the 12-
 Stage A runs the steps of Table~\ref{tab:stage-a} in order. Each step caches its result on disk,
 and later steps only read those files, so the steps are independent programs joined by files.
 \begin{table}[H]\centering
-\caption{Stage A steps as executed, with RTX PRO 6000 wall-clock times.}\label{tab:stage-a}
+\caption{Stage A steps and their wall-clock times. \textbf{Setup:} RTX PRO 6000 (96 GB); frame 0 of the 12 training cameras at $1920\times1080$; timed during the 700-frame run.}\label{tab:stage-a}
 \small\begin{tabular}{p{.13\linewidth}p{.52\linewidth}p{.18\linewidth}r}\toprule
 Step & What runs & Writes & Time \\\midrule
 \texttt{calib} & Loads the 12 training cameras and images; draws the camera layout. & \texttt{calib/} & 2.1 s \\
@@ -447,7 +448,7 @@ better); person PSNR measures it only on player regions; IoU measures how well p
 player masks overlap (1 is perfect). The diagnostic's held-out result is the important generalization
 measurement because those cameras were never trained on.
 \begin{table}[H]\centering
-\caption{Quality summary. Temporal held-out samples coincide with keyframes.}
+\caption{Quality summary. \textbf{Setup:} all rows RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted); scores are averages over the 24 test cameras unless the last column says otherwise. Test frames are every tenth video frame, which are also keyframes.}
 \begin{tabular}{lrrrr}\toprule
 Method & Full PSNR & Person PSNR & Person IoU & Measurement \\\midrule
 Global 3DGS baseline & 17.50 & -- & -- & frame-0 held-out \\
@@ -468,7 +469,7 @@ Final 300-frame diagnostic & 20.07 & 22.44 & -- & held-out mean \\\bottomrule
 \begin{minipage}[b]{.32\linewidth}\centering
 \includegraphics[width=\linewidth]{figures/view13_courtflow_f200.png}\\\small CourtFlow-GS diagnostic
 \end{minipage}
-\caption{Same-camera comparison at held-out view 13, frame 200. Replace or add comparison rows as desired.}
+\caption{The same test camera (view 13) at frame 200. \textbf{Setup:} RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted).}
 \end{figure}
 
 \subsection{Why these design choices were selected}
@@ -477,7 +478,7 @@ the practical failures we observed and the smallest change that addressed each o
 trade-offs: some choices improve quality and speed at the same time by avoiding work on irrelevant
 pixels, while others deliberately spend more computation only where player detail needs it.
 \begin{table}[H]\centering
-\caption{Design choices and the observation behind each one.}\label{tab:choices}
+\caption{Design choices and the observation behind each one. \textbf{Setup:} observations from development runs on the RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted).}\label{tab:choices}
 \small\begin{tabular}{p{.31\linewidth}p{.61\linewidth}}\toprule
 Choice & Why it was selected \\\midrule
 3D-first identities & Matching 2D centres and colours independently fragmented 68 masks into 60 apparent people. Building rough 3D components first gives the same player one ID across cameras. \\
@@ -507,14 +508,14 @@ packed, quantized frame chunks rather than text PLY files.
 
 \section{Runtime}
 \begin{table}[H]\centering
-\caption{Runtime on both GPUs (preliminary for the PRO 6000). Working resolution: RTX 3080
-1874$\times$1054 with tracking renders at 937$\times$527; RTX PRO 6000 1920$\times$1080 with
-tracking renders at 960$\times$540 (5\% more pixels, so the PRO 6000 speed-ups are slightly
-understated). Stage B rows are steady-state means over the same frames 2--29 (28 frames, two
-keyframes) with the identical production configuration, including 3D identity repair, on both
-GPUs. Frame 1 is excluded because the 3080 compiled its CUDA kernels there (159 s); the PRO 6000
-compiles them beforehand. The raster row renders a baked checkpoint at the stated
-resolution.}\label{tab:runtime}
+\caption{Runtime on both GPUs; the PRO 6000 values are preliminary. \textbf{Setup:}
+RTX 3080 (12 GB) with training images at $1874\times1054$ and tracking renders at $937\times527$;
+RTX PRO 6000 (96 GB) with training images at $1920\times1080$ and tracking renders at $960\times540$.
+The PRO 6000 handles 5\% more pixels, so its speed-ups are slightly understated. Both GPUs ran the
+same settings, including the 3D identity repair. The Stage A row is the whole frame-0 build. The
+Stage B rows average video frames 2--29 (28 frames, two keyframes) on both GPUs; frame 1 is left out
+because the 3080 spent 159~s compiling its CUDA code there, which the PRO 6000 does ahead of time.
+The raster row draws one saved checkpoint at the stated size.}\label{tab:runtime}
 \small\begin{tabular}{lrrr}\toprule
 Component & RTX 3080 12 GB & RTX PRO 6000 & Speed-up \\\midrule
 Stage A frame-0 canonical build & 1896 s & 528 s & 3.6$\times$ \\
