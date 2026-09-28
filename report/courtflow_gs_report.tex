@@ -528,15 +528,50 @@ test view at frame 650 drops from 18.6 to 16.5~dB with visible floaters. The unc
 the best player score, because its players keep receiving new Gaussians, but its background falls
 apart.
 
+\paragraph{Are players sharper with 3 million Gaussians?} In the videos, players in the 3 million run
+can look sharper and more solid, and the player score in Table~\ref{tab:budget} agrees (23.31 against
+23.02~dB). That score, however, is an average over test cameras. Scoring each person separately, on
+exactly the same pixels for both runs (Table~\ref{tab:per-player}), gives the opposite answer: the
+2 million run is better for 14 of the 15 people and objects, and by 0.57~dB overall. Both are correct,
+because they weigh cameras differently. Averaging per camera rewards the 3 million run for looking
+better in most views (it wins on 31 of 44 test frames); pooling every player pixel penalizes it for
+a few views where players are badly wrong, usually where a returning floater crosses a player. In
+short, 3 million gives sharper players in typical views, but less reliable players and a worse
+background, so 2 million remains the better overall choice.
+\begin{table}[H]\centering
+\caption{Player PSNR per person on the 24 test cameras, frames 300--650 (the saved full states that
+record which Gaussian belongs to whom). Each person's region is where either run draws that person
+(footprint weight $>0.05$, widened by 6 pixels), so both runs are scored on identical pixels. The 14
+people are 10 players, 3 referees and one staff member. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted).}\label{tab:per-player}
+\small\begin{tabular}{lrrr}\toprule
+Person & 2 million & 3 million & Difference \\\midrule
+Person 1 & 21.60 & 20.61 & $-$0.99 \\
+Person 2 & 23.20 & 22.40 & $-$0.80 \\
+Person 3 & 24.77 & 23.35 & $-$1.42 \\
+Person 4 & 21.90 & 21.62 & $-$0.28 \\
+Person 5 & 22.79 & 21.82 & $-$0.97 \\
+Person 6 & 23.84 & 23.79 & $-$0.05 \\
+Person 7 & 22.02 & 21.64 & $-$0.38 \\
+Person 8 & 22.99 & 23.04 & +0.05 \\
+Person 9 & 17.37 & 17.15 & $-$0.22 \\
+Person 10 & 22.45 & 22.26 & $-$0.19 \\
+Person 11 & 22.47 & 21.93 & $-$0.54 \\
+Person 12 & 20.75 & 18.85 & $-$1.90 \\
+Person 13 & 17.21 & 16.87 & $-$0.34 \\
+Person 14 & 21.28 & 20.93 & $-$0.35 \\
+Ball & 22.59 & 22.40 & $-$0.19 \\\midrule
+All, pooled & \textbf{22.29} & 21.72 & $-$0.57 \\\bottomrule
+\end{tabular}\end{table}
+
 Compared with no cap, the final method is faster (4.27 instead of 4.87~s per frame), keeps a scene
 of 2 million instead of 6.86 million Gaussians, and scores 1.09~dB higher on the test cameras over
 the whole video. This is the speed-and-quality trade-off the assignment asks about, and here one
 change improves both. The price is 0.7~dB of player PSNR.
 \begin{table}[H]\centering
 \caption{Scene-size budget, whole video. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Averages over the 69
-test frames (each the mean of the 24 test cameras). $^\ast$The 3 million run shared the GPU with another run, so its time is inflated.}\label{tab:budget}
+test frames (each the mean of the 24 test cameras). $^\ast$The 3 million run shared the GPU with another run, so its time is inflated. $^\dagger$Player PSNR here is computed per test camera over all players together and then averaged over cameras; Table~\ref{tab:per-player} scores each player separately.}\label{tab:budget}
 \small\begin{tabular}{lrrrrrr}\toprule
-Budget & Gaussians at end & PSNR & SSIM & LPIPS & Player PSNR & Tracking s/frame \\\midrule
+Budget & Gaussians at end & PSNR & SSIM & LPIPS & Player PSNR$^\dagger$ & Tracking s/frame \\\midrule
 Uncapped & 6.86M & 19.34 & 0.675 & 0.243 & 23.70 & 4.87 \\
 1.5$\times$ frame 0 & 1.10M & 20.18 & 0.681 & 0.238 & 22.75 & 3.71 \\
 2 million & 2.00M & \textbf{20.43} & \textbf{0.689} & \textbf{0.230} & 23.02 & 4.27 \\
