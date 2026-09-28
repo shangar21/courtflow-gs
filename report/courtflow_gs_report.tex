@@ -73,7 +73,7 @@ split on the court floor.
 
 For a missing camera mask, we accept the new SAM2 result only if its colour is similar to that same
 3D player in the other cameras. If it still looks wrong, we mark that player as \emph{unknown} in
-that camera---not as background. This is important: a hidden or missed player should not teach the
+that camera, not as background. This is important: a hidden or missed player should not teach the
 model that the court is visible there. Finally, if two accepted masks overlap, the closer player
 owns the pixel. The result is one label image $L_c$ per camera in which every pixel is either
 background or exactly one player. Later, this lets every player have separate Gaussian splats and
@@ -85,7 +85,7 @@ The usual rule says to remove a voxel if even one camera does not see the player
 for a clean object on a turntable, but fails in basketball: another player, the hoop support, or
 padding can hide a real arm, leg, or head. We saw those missing body parts with a strict hull.
 
-The opposite rule---forgiving any missing view---was also bad. One allowed miss made player hulls
+The opposite rule, forgiving any missing view---was also bad. One allowed miss made player hulls
 about $2.5\times$ too large. Our compromise asks one simple question: \emph{is there measured
 evidence that something closer to this camera was blocking the player?} We forgive a missing pixel
 only when the answer is yes. This is what ``occlusion-aware'' means here.
@@ -230,7 +230,7 @@ and improve either player crops or a periodic full keyframe.
 \For{each $f$ in the video sequence}
   \State $\mathit{images} \gets \textsc{DecodeUndistortNormalize}(\mathit{trainingVideos},f)$
   \If{$f \bmod 5 = 0$}
-    \State $\mathit{masks} \gets \textsc{SAM2RePrompt}(\mathit{images},\mathit{state.dynamic})$
+    \State $\mathit{masks} \gets \textsc{RepairMultiViewSAM2Identities}(\mathit{images},\mathit{state.dynamic})$
     \State $\mathit{anchors} \gets \textsc{TriangulateMaskCentroids}(\mathit{masks})$
   \Else
     \State $\mathit{masks},\mathit{anchors} \gets \emptyset,\emptyset$
@@ -278,6 +278,40 @@ Final 300-frame diagnostic & 20.07 & 22.44 & -- & held-out mean \\\bottomrule
 \caption{Same-camera comparison at held-out view 13, frame 200. Replace or add comparison rows as desired.}
 \end{figure}
 
+\subsection{Why these design choices were selected}
+The method was not chosen by adding complexity for its own sake. Table~\ref{tab:choices} records
+the practical failures we observed and the smallest change that addressed each one. These are useful
+trade-offs: some choices improve quality and speed at the same time by avoiding work on irrelevant
+pixels, while others deliberately spend more computation only where player detail needs it.
+\begin{table}[H]\centering
+\caption{Design choices and the observation behind each one.}\label{tab:choices}
+\small\begin{tabular}{p{.31\linewidth}p{.61\linewidth}}\toprule
+Choice & Why it was selected \\\midrule
+3D-first identities & Matching 2D centres and colours independently fragmented 68 masks into 60 apparent people. Building rough 3D components first gives the same player one ID across cameras. \\
+Occlusion-aware hull & A strict silhouette intersection removed hidden limbs. Allowing arbitrary misses inflated a hull by about $2.5\times$. Measured nearer depth supplies the middle ground. \\
+Masked MASt3R crops & Full-frame descriptors reduce a small player to about $6\times25$ pixels and produced star-shaped rays. Crops spend the fixed descriptor resolution on the player instead of the court. \\
+Same-group MLS controls & A global control graph lets nearby teammates pull each other. Fixed same-player control neighbours keep motions separate and also make deformation cheap. \\
+Shared translation plus local offsets & Moving every control alone reached 0.60 IoU by frame 10; shared translation plus local articulation reached 0.71 IoU. \\
+Crop refinement plus keyframes & Full-image updates mostly optimize static court pixels. Player crops improve moving detail cheaply; full keyframes occasionally correct accumulated error and add splats. \\\bottomrule
+\end{tabular}\end{table}
+
+\subsection{Evaluation protocol and deliverables}
+The 12 training cameras are never used as novel-view evidence. At every tenth frame and at the final
+frame, the tracker renders all 24 held-out cameras and compares them to their synchronized real
+images. The current report gives full-frame PSNR and player-region PSNR; player-region IoU checks
+whether the rendered player footprint agrees with the independent mask. The final RTX PRO 6000 run
+will report the mean and standard deviation over the held-out camera/frame pairs, together with
+SSIM and LPIPS, and will include a grid of easy, crowded, and occluded held-out views. This makes
+it clear that quality is measured from cameras the model did not optimize against.
+
+The release command produces two animated deliverables during tracking: a held-out camera video
+and an orbit video. These renders use the state from each corresponding video frame. This matters
+because one baked PLY checkpoint is a snapshot at one instant; repeating the final snapshot would
+make a static movie, not an animation. The editable canonical model, controls, and calibration are
+kept for re-training or editing. The final source scene is about 150 MB on the RTX 3080; a naive
+per-frame PLY bake would be about 42 GB for 300 frames, so a deployable animated package should use
+packed, quantized frame chunks rather than text PLY files.
+
 \section{RTX 3080 runtime}
 \begin{table}[H]\centering
 \caption{Runtime. A frame normally uses MLS, crop refinement, and occasionally the more expensive
@@ -295,11 +329,19 @@ The fused MLS/SVD calculation is only a small part of tracking time. Rendering a
 through the rasterizer dominate optimization. Once motion is baked, GPU rendering is fast; the
 current video exporter is instead limited by copying frames from Python to ffmpeg.
 
+The frame-0 canonical build took 1896 s (31.6 min) on the RTX 3080, including geometry, crops,
+fusion, and Gaussian training. The 300-frame diagnostic's measured 7.61 s/frame corresponds to
+about 38.1 min for Stage B alone. These are 3080 reference measurements, not extrapolations to the
+PRO 6000. The complete 700-frame PRO 6000 run will replace the placeholders above with measured
+wall-clock time, peak VRAM, and inference time at stated 1080p and 4K resolutions.
+
 \section{Limitations and next steps}
 The main remaining weakness is identity tracking in crowded late-game plays. Independent SAM2 masks
-can swap people or disappear. In the final diagnostic, training IoU falls from 0.789 near the start
-to 0.001 at frame 299; held-out person PSNR falls from 23.86 to 20.59 dB. The highest-priority
-improvement is detector-led, multi-view identity association at keyframes. Other useful work is a
-smaller or level-of-detail version of the 2.01M-Gaussian final state, unbiased held-out evaluation
-between keyframes, and direct GPU-to-NVENC video output.
+can swap people or disappear. In the previous diagnostic, training IoU falls from 0.789 near the
+start to 0.001 at frame 299; held-out person PSNR falls from 23.86 to 20.59 dB. The production
+configuration now repairs SAM2 identities in 3D at mask frames and performs conservative keyframe
+recovery when a repaired mask shows that a player was lost. The 300-frame repair run tests whether
+that change removes the observed failure rather than merely moving it later in the sequence. Other
+useful work is a smaller or level-of-detail version of the 2.01M-Gaussian final state, unbiased
+inter-keyframe held-out evaluation, and direct GPU-to-NVENC video output.
 \end{document}
