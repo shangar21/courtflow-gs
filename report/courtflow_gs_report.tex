@@ -16,7 +16,7 @@
 be viewed from a new camera angle. It first builds one clean, static ``starting scene'' from frame
 0. It then follows each player through the video by moving small sets of control points, and
 occasionally improves visual detail. On one RTX PRO 6000 it reconstructs all 700 frames from 12 of the 36 cameras
-in about two hours, and the 24 cameras it never sees score 20.2~dB PSNR on average over the whole
+in about two hours, and the 24 cameras it never sees score 20.4~dB PSNR on average over the whole
 video. The result is a 3D reconstruction, novel-view videos, and a saved Gaussian model that can be
 rendered from any camera without retraining.
 \end{abstract}
@@ -325,7 +325,7 @@ the full image. We run 100 refinement iterations on two crops per step. No splat
 removed here, so their control bindings stay stable.
 
 Every tenth frame is a keyframe. It instead runs 500 full-image iterations, can add splats from
-iteration 50 every 50 iterations until 60\% of the schedule, and limits growth to 5\% per keyframe and to 1.5 times the frame-0 size in total (Figure~\ref{fig:drift} shows why the total cap matters).
+iteration 50 every 50 iterations until 60\% of the schedule, and limits growth to 5\% per keyframe and to 2 million Gaussians in total (Figure~\ref{fig:drift} shows why the total cap matters).
 It then reconnects each Gaussian to its eight nearest same-group controls and refreshes the cached
 background. Held-out cameras are never included in any training loss.
 
@@ -438,8 +438,8 @@ and the moving players are rendered over a cached background image.
 around moving players. Every tenth frame is a keyframe. First, a health check compares each
 player's rendered footprint with the repaired masks; a player whose overlap has fallen below
 0.10 IoU is re-initialized from its canonical shape at its anchor. Then 500 full-image iterations
-run with limited densification (at most 5\% more Gaussians per keyframe, and never more than 1.5 times
-the frame-0 total), the Gaussians are re-bound to their controls, and the background
+run with limited densification (at most 5\% more Gaussians per keyframe, and never more than 2 million
+in total), the Gaussians are re-bound to their controls, and the background
 cache is refreshed.
 \item \textbf{Record.} The current state is rendered for held-out views 13 and 26 and for the orbit
 camera and streamed to ffmpeg, so each video frame shows the scene at that instant. Every tenth
@@ -489,15 +489,15 @@ is not shown.}\label{tab:final-quality}
 \small\begin{tabular}{lrrrr}\toprule
 Result & PSNR & SSIM & LPIPS & Player PSNR \\\midrule
 Frame-0 scene (Stage A) & 20.08 & 0.679 & 0.229 & -- \\
-\textbf{Whole video, final method} & \textbf{20.19 $\pm$ 0.52} & \textbf{0.681 $\pm$ 0.017} & \textbf{0.238 $\pm$ 0.014} & \textbf{22.75 $\pm$ 1.71} \\
-\quad first half (frames 0--349) & 20.65 & -- & -- & 23.85 \\
-\quad second half (frames 350--699) & 19.73 & -- & -- & 21.69 \\
+\textbf{Whole video, final method (2M cap)} & \textbf{20.43 $\pm$ 0.45} & \textbf{0.689 $\pm$ 0.016} & \textbf{0.230 $\pm$ 0.013} & \textbf{23.02 $\pm$ 1.89} \\
+\quad first half (frames 0--349) & 20.84 & -- & -- & 24.30 \\
+\quad second half (frames 350--699) & 20.03 & -- & -- & 21.78 \\
 Whole video, before the growth fix & 19.34 $\pm$ 1.49 & 0.675 $\pm$ 0.035 & 0.243 $\pm$ 0.031 & 23.70 $\pm$ 1.64 \\\bottomrule
 \end{tabular}\end{table}
 
 For comparison, ClipGStream reached 17.2--17.9~dB on the same 24 test cameras
 (Table~\ref{tab:clipgstream}), and it did so at a lower resolution ($960\times540$), which makes
-PSNR easier, and only on the first 10 frames. \method holds 20.19~dB on average over all 700 frames
+PSNR easier, and only on the first 10 frames. \method holds 20.43~dB on average over all 700 frames
 at $1920\times1080$.
 
 \subsection{A failure that only appears late in the video}
@@ -511,32 +511,36 @@ the stands nearest the camera (Figure~\ref{fig:uncapped-grid}). Test PSNR fell f
 We tested three fixes on the first 300 frames before choosing one. Freezing the background at
 keyframes was about 2~dB \emph{worse} from frame 50 onward: keyframes are genuinely useful for the
 background, for example to fill in court that was hidden behind a player at frame 0. Capping the
-total size worked. The final method still lets each keyframe add up to 5\%, but never lets the scene
-grow beyond 1.5 times its frame-0 size. With the cap, test PSNR ends at 19.3~dB instead of 16.1~dB
-(Figure~\ref{fig:drift}, blue).
+total size worked. Each keyframe may still add up to 5\%, but the scene may never grow past a fixed
+total. A first cap at 1.5 times the frame-0 size (1.1 million Gaussians) already ended at 19.3~dB
+instead of 16.1~dB (Figure~\ref{fig:drift}, blue), and was faster (3.71 instead of 4.87~s per frame),
+used less GPU memory (7.2 instead of 12.1~GB), and saved a 114~MB instead of a 714~MB final scene.
 
-The fix improved speed and quality together, which is the trade-off the assignment asks about.
-Tracking became faster (3.71 instead of 4.87~s per frame), peak GPU memory fell from 12.1 to 7.2~GB,
-the final model shrank from 714~MB to 114~MB, and the test PSNR over the whole video rose by
-0.85~dB. The cost is about 1~dB of player PSNR: with a fixed budget, players receive fewer new
-Gaussians for extra detail.
+\paragraph{How large should the budget be?} The 1.1 million cap fixes the collapse but leaves
+players short of detail, so we compared budgets of 2 and 3 million Gaussians over the whole video
+(Table~\ref{tab:budget}). The 3 million run was started from the 2 million run's saved state at
+frame 250, before the two differ, instead of from frame 0. \textbf{2 million is the best overall
+and is the final method}: it has the best test PSNR (20.43~dB), SSIM and LPIPS, it ends at 19.6~dB
+instead of 19.3~dB (Figure~\ref{fig:drift}, green dotted line), and it costs 15\% more tracking
+time than 1.1 million. Going to 3 million improves players by another 0.3~dB, but the background
+starts to break up again: test PSNR in the second half falls from 20.03 to 19.40~dB, and the worst
+test view at frame 650 drops from 18.6 to 16.5~dB with visible floaters. The uncapped run still has
+the best player score, because its players keep receiving new Gaussians, but its background falls
+apart.
 
-\paragraph{How large should the budget be?} The 1.5$\times$ cap (1.1 million Gaussians) fixes the
-collapse but leaves players short of detail, so we also ran a cap of 2 million Gaussians
-(Figure~\ref{fig:drift}, green dotted line). It is better on every score (Table~\ref{tab:budget}):
-test PSNR over the whole video rises to 20.43~dB, players gain 0.27~dB, and the final frame ends at
-19.6~dB instead of 19.3~dB. It costs 15\% more tracking time (4.27 instead of 3.71~s per frame). The
-uncapped run still has the best player score, because its players keep receiving new Gaussians,
-but its background falls apart.
+Compared with no cap, the final method is faster (4.27 instead of 4.87~s per frame), keeps a scene
+of 2 million instead of 6.86 million Gaussians, and scores 1.09~dB higher on the test cameras over
+the whole video. This is the speed-and-quality trade-off the assignment asks about, and here one
+change improves both. The price is 0.7~dB of player PSNR.
 \begin{table}[H]\centering
 \caption{Scene-size budget, whole video. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Averages over the 69
-test frames (each the mean of the 24 test cameras).}\label{tab:budget}
+test frames (each the mean of the 24 test cameras). $^\ast$The 3 million run shared the GPU with another run, so its time is inflated.}\label{tab:budget}
 \small\begin{tabular}{lrrrrrr}\toprule
 Budget & Gaussians at end & PSNR & SSIM & LPIPS & Player PSNR & Tracking s/frame \\\midrule
 Uncapped & 6.86M & 19.34 & 0.675 & 0.243 & 23.70 & 4.87 \\
 1.5$\times$ frame 0 & 1.10M & 20.18 & 0.681 & 0.238 & 22.75 & 3.71 \\
 2 million & 2.00M & \textbf{20.43} & \textbf{0.689} & \textbf{0.230} & 23.02 & 4.27 \\
-3 million & \textcolor{red}{[running]} & & & & & \\\bottomrule
+3 million & 3.00M & 20.11 & 0.686 & 0.233 & 23.31 & 6.68$^\ast$ \\\bottomrule
 \end{tabular}\end{table}
 \begin{figure}[H]\centering
 \includegraphics[width=.86\linewidth]{figures/growth_cap_drift.pdf}
@@ -554,8 +558,9 @@ Figure~\ref{fig:final-grid} shows the final method at an early frame (100) and a
 (650). To avoid hand-picking flattering views, a script scores all 24 test cameras at that frame and
 shows the best, the median, and the worst. At frame 100 even the worst view is close to the real
 image. At frame 650 the court and crowd are still clean, but players in the crowded play near the
-far basket become blurred or broken up, and a few thin floaters appear. This matches the numbers:
-the background holds up, while player quality drops in the second half (23.85 to 21.69~dB).
+far basket become blurred or broken up, and a few small floaters appear in the stands nearest the camera.
+This matches the numbers: the background holds up, while player quality drops in the second half
+(24.30 to 21.78~dB).
 \begin{figure}[H]\centering
 \includegraphics[width=.9\linewidth,height=.78\textheight,keepaspectratio]{figures/heldout_grid_final_1080p.jpg}
 \caption{Final method: best, median, and worst test cameras at frames 100 and 650 (left: real image,
@@ -610,7 +615,7 @@ Masked MASt3R crops & Full-frame descriptors reduce a small player to about $6\t
 Same-group MLS controls & A global control graph lets nearby teammates pull each other. Fixed same-player control neighbours keep motions separate and also make deformation cheap. \\
 Shared translation plus local offsets & Moving every control alone reached 0.60 IoU by frame 10; shared translation plus local articulation reached 0.71 IoU. \\
 Crop refinement plus keyframes & Full-image updates mostly optimize static court pixels. Player crops improve moving detail cheaply; full keyframes occasionally correct accumulated error and add splats. \\
-Growth cap (found on the PRO 6000) & Uncapped keyframe growth compounded to 6.86M Gaussians and 16.1~dB by frame 699. Capping the total at 1.5$\times$ the frame-0 size kept 1.10M Gaussians and 19.3~dB, and was faster. \\\bottomrule
+Growth cap (found on the PRO 6000) & Uncapped keyframe growth compounded to 6.86M Gaussians and 16.1~dB by frame 699. Capping the total at 2 million Gaussians ended at 19.6~dB, was faster, and scored best of the budgets tried (1.1M, 2M, 3M). \\\bottomrule
 \end{tabular}\end{table}
 
 \subsection{Evaluation protocol and deliverables}
@@ -622,9 +627,9 @@ short 300-frame comparison; its effect on the full video is reported above.
 The run writes two animated videos while it tracks: a test-camera video (view 13) and a camera that
 orbits the court. Each video frame is drawn from the scene exactly as it was at that moment of the
 game. The final results folder also keeps the editable frame-0 scene (79~MB), the control-point paths
-for all 700 frames (109~MB), and the final scene state (114~MB, 1.10 million Gaussians). A single
+for all 700 frames (113~MB), and the final scene state (208~MB, 2.0 million Gaussians). A single
 saved state is one instant of the game, not the whole video: storing every frame naively would take
-about $700\times114$~MB $\approx$ 80~GB, so a practical package would store the frame-0 scene plus the
+about $700\times208$~MB $\approx$ 146~GB, so a practical package would store the frame-0 scene plus the
 per-frame motion in compressed form.
 
 \section{Runtime}
@@ -633,8 +638,8 @@ Table~\ref{tab:e2e} shows where the time goes in one complete run of the final m
 6000, from the raw videos to finished novel-view videos.
 \begin{table}[H]\centering
 \caption{End-to-end time for the final method. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The tracking row is
-the final (growth-capped) run; the steps before it are identical in both 700-frame runs and were
-reused from the first run.}\label{tab:e2e}
+the final run with the 2 million cap; the steps before it do not depend on the cap and were
+measured in the first 700-frame run.}\label{tab:e2e}
 \small\begin{tabular}{lr}\toprule
 Step & Wall-clock time \\\midrule
 Prepare input (undistort frame 0) & 0.3 min \\
@@ -642,12 +647,14 @@ Stage A: build and score the frame-0 scene & 9.9 min \\
 Decode 700 frames from 36 videos & 11.2 min \\
 SAM2 player masks, 12 cameras one after another & 31.2 min \\
 Track the ball & 10.7 min \\
-Track players and refine, 700 frames (incl.\ test scoring and videos) & 48.3 min \\\midrule
-\textbf{Total} & \textbf{$\approx$ 112 min} \\\bottomrule
+Track players and refine, 700 frames (incl.\ test scoring and videos) & 55.3 min \\\midrule
+\textbf{Total} & \textbf{$\approx$ 119 min} \\\bottomrule
 \end{tabular}\end{table}
-Tracking itself costs 3.71~s per video frame (0.27 frames per second): 1.36~s moving control points,
-1.09~s refining player crops on nine frames out of ten, 6.49~s for each tenth-frame keyframe, and
-0.72~s (averaged) for masks and identity repair. Peak GPU memory was 7.2~GB. Almost half of the time
+Tracking itself costs 4.27~s per video frame (0.23 frames per second): 1.48~s moving control points,
+1.37~s refining player crops on nine frames out of ten, 8.13~s for each tenth-frame keyframe, and
+0.75~s (averaged) for masks and identity repair. For a few minutes this run shared the GPU with a
+scoring job, so these times are slightly pessimistic. Peak GPU memory was 7.2~GB with the 1.1 million
+cap and 12.1~GB with no cap; the 2 million run was not measured on its own. Almost half of the time
 before tracking is spent on data preparation rather than reconstruction; Section~\ref{sec:4k} measures
 the faster data path (JPEG frames, GPU undistortion, and SAM2 on four cameras at once) used for the
 4K run.
@@ -794,9 +801,9 @@ missing views.
 \section{Limitations and next steps}
 \begin{itemize}
 \item \textbf{Players in crowded plays.} Player tracking still degrades late in the video. The
-training-camera mask overlap falls from 0.55 at frame 100 to about 0.20 after frame 600, and the
-method needed 190 recoveries, where a lost player is reset from its frame-0 shape. Player PSNR drops
-from 23.85~dB in the first half to 21.69~dB in the second. The next step is to reduce these
+training-camera mask overlap falls from 0.52 at frame 100 to about 0.16 after frame 600, and the
+method needed 205 recoveries, where a lost player is reset from its frame-0 shape. Player PSNR drops
+from 24.30~dB in the first half to 21.78~dB in the second. The next step is to reduce these
 recoveries, for example by tracking players jointly when they overlap instead of one at a time.
 \item \textbf{A few thin floaters.} Some long, thin Gaussians near the cameras still show up as
 streaks in a few test views. Limiting how elongated a new Gaussian may become would target them.
