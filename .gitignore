@@ -29,3 +29,6 @@ report/*.out
 ring_init/configs/*.local.json
 ring_init/configs/basketball.json
 ring_init/configs/basketball_sam2_tiny.json
+report/*.fdb_latexmk
+report/*.fls
+report/*.synctex.gz
