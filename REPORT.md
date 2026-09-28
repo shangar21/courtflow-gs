@@ -1,3 +1,15 @@
+# Archived early draft — do not use for final results
+
+This document records the pre-PRO-6000, 300-frame development work and is retained only for
+historical context. Its measurements, commands, and conclusions have been superseded.
+
+Use [the final report](report/courtflow_gs_report.pdf) for the submission: it covers the final
+700-frame, 12-input-view reconstruction, held-out 24-view evaluation, runtime, inference, and
+limitations. The final 1080p result is 20.43 dB mean held-out PSNR on one RTX PRO 6000, completed
+in approximately 119 minutes end to end.
+
+---
+
 # CourtFlow-GS
 
 ## Online multi-view dynamic Gaussian reconstruction with fused MLS tracking

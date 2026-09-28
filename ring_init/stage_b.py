@@ -385,6 +385,11 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
     orbit = orbit_cameras(s.cameras, end - start, 360.0)
     writers = {v: _VideoWriter(d / "videos" / f"heldout_view{v:02d}.mp4", c.width // 2 * 2, c.height // 2 * 2) for v, c in vid_cams.items()}
     oc0 = _camera_frame(orbit[0], None, dev, cfg.v2_video_scale); writers["orbit"] = _VideoWriter(d / "videos" / "orbit360.mp4", oc0.width // 2 * 2, oc0.height // 2 * 2)
+    exporter = None
+    if cfg.v2_export_playback:
+        from ring_init.playback import PlaybackExporter
+        exporter = PlaybackExporter(d / "playback", allc, cfg.video_fps, start, end, cfg.v2_keyframe_every)
+        exporter.write_frame(start, tracker.model, True)
     positions = [ctrl.pos.cpu().numpy()]; metrics = []; refiner = None; repair = None; boost = torch.ones(len(person_ids), device=dev)
     frame0_ids = [int(k) for k in np.unique(np.concatenate([np.unique(l) for l in frame0])) if k > 0]
     resume_frame = None
@@ -515,6 +520,8 @@ def step_track_scene(s: Scene, start: int, end: int, tag: str = "stage_b_v2", re
             info["touchup_s"] = tracker.touch_up(cams)
         info.update({"frame": f, "io_s": io_s, "gaussians": len(tracker.model)})
         positions.append(tracker.ctrl.pos.cpu().numpy())
+        if exporter is not None:
+            exporter.write_frame(f, tracker.model, (f - start) % cfg.v2_keyframe_every == 0)
         write_videos(f)
         print(f"  frame {f:4d}: {info['iterations']:3d} it, loss {info['first_loss']:.4f}->{info['final_loss']:.4f}, deform {info['deform_s']:.2f}s"
               + (f", keyframe {info['keyframe_s']:.1f}s ({info['gaussians_before']}->{info['gaussians_after']})" if "keyframe_s" in info

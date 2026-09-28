@@ -179,6 +179,7 @@ class Config:
     v2_video_views: tuple[int, ...] = (13, 26)    # held-out source views rendered to video online
     v2_video_scale: float = 0.5
     v2_save_ply_every: int = 25
+    v2_export_playback: bool = False              # write a self-contained forward-only playback/ package
     # Ball (own instance + control points).
     ball: bool = True
     ball_radius_m: float = 0.1215                 # size-7 basketball

@@ -1,8 +1,20 @@
 \documentclass[11pt]{article}
 \usepackage[margin=0.9in]{geometry}
-\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref,algorithm,algpseudocode,xspace}
+\usepackage{graphicx,booktabs,amsmath,xcolor,float,placeins,hyperref,algorithm,algpseudocode,xspace}
 \usepackage{mathptmx} % Times New Roman-compatible text and mathematics
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
+% Let floats move slightly when necessary: forcing every visual at its source
+% creates sparse pages and excessive gaps around the surrounding discussion.
+\raggedbottom
+\setlength{\floatsep}{8pt plus 2pt minus 2pt}
+\setlength{\textfloatsep}{10pt plus 2pt minus 3pt}
+\setlength{\intextsep}{8pt plus 2pt minus 2pt}
+\setlength{\abovecaptionskip}{4pt}
+\setlength{\belowcaptionskip}{2pt}
+\renewcommand{\topfraction}{0.90}
+\renewcommand{\bottomfraction}{0.75}
+\renewcommand{\textfraction}{0.08}
+\renewcommand{\floatpagefraction}{0.80}
 \newcommand{\method}{\textsc{CourtFlow-GS}\xspace}
 \title{\method: Online Multi-View Dynamic Gaussian Reconstruction with Fused MLS Tracking}
 \author{Shangar Muhunthan}
@@ -84,7 +96,7 @@ few of them. When every blob can move freely, the method can match those few ima
 putting blobs in the wrong 3D place. The result looks right from the training cameras and wrong
 from any new camera.
 
-\begin{table}[H]\centering
+\begin{table}[!htbp]\centering
 \caption{The settings each method was published with. Numbers come from the papers, which use
 different datasets and GPUs, so this shows what each method was built for; it is not a direct
 speed or quality comparison.}\label{tab:related}
@@ -106,7 +118,7 @@ Table~\ref{tab:clipgstream} shows the problem described above. On the training c
 longer made the test score \emph{worse} (17.88~dB after 6000 steps, 17.53~dB after 40000) even
 though the training score went up: the model was memorizing the 12 views rather than learning the
 3D scene. It also took about 13.5~s per frame on the 3080, after a 7.2~minute start-up.
-\begin{table}[H]\centering
+\begin{table}[!htbp]\centering
 \caption{ClipGStream on this capture. \textbf{Setup:} RTX 3080 (12 GB); $960\times540$ (the 4K capture
 quartered); 12 training cameras; scores averaged over the 24 test cameras on the first 10 video frames.
 PSNR and SSIM: higher is better. LPIPS: lower is better.}\label{tab:clipgstream}
@@ -142,6 +154,493 @@ The catch is a slower start: building the first frame carefully (Stage A) takes 
 3D Gaussian start. But that happens once per scene; after it, each frame takes a few seconds.
 
 \section{Methodology}
+\method reconstructs the game in two phases: it builds one reliable 3D scene at the opening frame,
+then updates that scene forward through time. This separation is important for a sparse camera ring:
+the static court and crowd are seen from many angles and should not be re-learned on every frame,
+while the small moving players need strong, identity-aware motion constraints.
+
+\paragraph{1. Build a canonical frame-0 scene.}
+The system undistorts the 12 training views, detects people, and associates their masks across
+cameras in 3D. It uses those multi-view identities to initialize separate Gaussian groups for each
+person, the ball, and the static background. The result is a clean starting scene with a known
+camera calibration and a fixed ownership for every Gaussian.
+
+\paragraph{2. Track players with a small motion model.}
+Instead of independently moving millions of Gaussians, each player follows a few control points.
+A shared translation captures running across the court, while small local control movements capture
+articulation. The controls affect only their own player's Gaussians, which prevents nearby players
+from pulling one another or the background. Periodic multi-view mask checks provide anchors when
+players are visible.
+
+\paragraph{3. Preserve detail without repeatedly rebuilding the court.}
+Most frames refine only image crops around the moving players. Every tenth frame is a full-scene
+keyframe: it corrects accumulated error, refreshes the static background, and may add a limited
+amount of detail. A global 2-million-Gaussian cap prevents the late-video floaters caused by
+unbounded growth.
+
+\paragraph{4. Test only on unseen cameras.}
+The other 24 cameras are never used in an optimization loss. We render them throughout the sequence
+to measure image quality and to expose errors that can be hidden in the 12 training views.
+
+This is an online reconstruction pipeline: each frame starts from the previous state rather than
+optimizing the complete 700-frame video jointly. The implementation details, losses, geometry
+filters, control-point equations, and complete pseudocode are in Appendix~\ref{app:method}.
+
+\begin{figure}[!htbp]
+\centering
+\includegraphics[width=\linewidth]{figures/courtflow_gs_pipeline.pdf}
+\caption{CourtFlow-GS pipeline. The editable diagram source is distributed with the report as
+\texttt{courtflow\_gs\_pipeline.drawio}.}
+\end{figure}
+
+\FloatBarrier
+
+\section{Execution Walkthrough}\label{sec:walkthrough}
+The previous section explains \emph{why} each part of the method exists. This section follows one
+complete run from the raw capture to the final videos: which program runs, what it reads, what it
+writes, and where time is spent. Everything is started by a single command,
+\begin{verbatim}
+python -m ring_init.e2e --scene basketball --dataset-dir <capture> \
+    --config config.local.json --out-dir <out> --frames 0:700
+\end{verbatim}
+where the capture directory holds the 36 videos (\texttt{cameras/view\_XXX.mp4}) and the COLMAP
+calibration (\texttt{calibration/}). The local configuration only names the SAM2 checkpoint; all
+other settings are the defaults, and the exact resolved configuration is written to
+\texttt{e2e\_config.json} in the output directory before any work starts. Every step writes a completion
+marker (\texttt{done.json}) next to its output, so an interrupted run resumes where it stopped and
+\texttt{--force step} recomputes a single step. The times below were measured on the RTX PRO 6000.
+
+\subsection{Preparing the input (17 s)}
+The capture adapter reads the calibration for all 36 cameras, decodes frame 0 of every video with
+ffmpeg (Lanczos resampling from $3840\times2160$ to the $1920\times1080$ working resolution), and
+removes lens distortion with OpenCV so every camera becomes an ideal pinhole camera. Every third
+view is copied as the 12 training images \texttt{cam\_00}\ldots\texttt{cam\_11}; all 36 undistorted
+frame-0 images are kept for held-out evaluation. The adapter also writes the 12-camera and
+36-camera calibration files used by the rest of the pipeline.
+
+\subsection{Stage A: building the frame-0 scene ($\approx$9 min)}
+Stage A runs the steps of Table~\ref{tab:stage-a} in order. Each step caches its result on disk,
+and later steps only read those files, so the steps are independent programs joined by files.
+\begin{table}[!htbp]\centering
+\caption{Stage A steps and their wall-clock times. \textbf{Setup:} RTX PRO 6000 (96 GB); frame 0 of the 12 training cameras at $1920\times1080$; timed during the 700-frame run.}\label{tab:stage-a}
+\small\begin{tabular}{p{.13\linewidth}p{.52\linewidth}p{.18\linewidth}r}\toprule
+Step & What runs & Writes & Time \\\midrule
+\texttt{calib} & Loads the 12 training cameras and images; draws the camera layout. & \texttt{calib/} & 2.1 s \\
+\texttt{match\_full} & MASt3R matches neighbouring ring cameras on whole frames (512 px). & 3D points & 33.4 s \\
+\texttt{floor} & RANSAC fits the court plane and its extent; fixes metric scale. & floor plane & 0.3 s \\
+\texttt{persons} & Faster R-CNN person boxes, then SAM2 masks, in every training camera. & per-camera masks & 11.7 s \\
+\texttt{instances} & Carves the court volume with all masks; 3D blobs become player IDs; re-prompts SAM2 for missing views. & label images $L_c$ & 16.7 s \\
+\texttt{hulls} & Occlusion-aware visual hull for every player. & voxel hulls & 4.3 s \\
+\texttt{match\_crops} & MASt3R on masked player crops for nearby camera pairs. & player points & 46.9 s \\
+\texttt{fuse} & Merges crop matches and hull fill into coloured seed clouds. & seed \texttt{.ply} & 5.6 s \\
+\texttt{train} & Optimizes each player's Gaussians, then the background with players composited in front. & Gaussian models & 406.9 s \\
+\texttt{export} & Copies the trained models into a canonical package with a manifest. & \texttt{canonical/} & $<$1 s \\
+\texttt{eval} & Renders frame 0 for all 24 held-out cameras and scores it. & \texttt{eval/} & -- \\\bottomrule
+\end{tabular}\end{table}
+Training is the only substantial cost. The detector, SAM2, and MASt3R networks are freed from GPU
+memory once their steps finish, so none of them competes with Gaussian training for memory.
+
+\subsection{Stage B, part 1: decoding the sequence}
+Before tracking starts, Stage B prepares all per-frame data. Six worker processes each stream one
+camera's video through ffmpeg and apply exactly the frame-0 preprocessing: the same resampling, the
+same precomputed undistortion map, and the same per-camera colour correction. The 12 training
+cameras are decoded at every frame (8400 images for 700 frames). The 24 held-out cameras are
+decoded only at every tenth frame, because they are used only for scoring. Frames are stored as
+lightly compressed PNG files, and already decoded frames are skipped on a rerun.
+
+SAM2 then runs once per training camera in video mode. It is prompted with that camera's frame-0
+player labels from Stage A and follows every player through the whole sequence. These raw masks
+are not trusted as they are: SAM2 treats each camera separately and can swap two players in one
+camera but not another. Identities are therefore repaired in 3D during tracking (below). Finally,
+the ball is detected and triangulated at frame 0, tracked causally through the sequence with a
+gravity and bounce model, and added to the canonical scene as its own small group of Gaussians.
+
+\subsection{Stage B, part 2: the per-frame loop}
+The canonical Gaussians are loaded onto the GPU once and stay there for the whole sequence. Control
+points are placed on every group (1024 per player, 16 on the ball, 1000 on the background), and each
+Gaussian is bound to its eight nearest same-group controls. Then, for every frame $f$:
+\begin{enumerate}
+\item \textbf{Load.} A background thread has already read frame $f$'s 12 training images from disk
+while the GPU was busy with frame $f-1$. The images are downsampled to the tracking resolution
+($960\times540$) and uploaded; the full-resolution copies are kept for refinement.
+\item \textbf{Masks and anchors (every fifth frame).} The SAM2 masks for frame $f$ are read, their
+identities are rebuilt in 3D exactly as in Stage A's \texttt{instances} step, and the repaired masks
+are matched to the tracked players by position and jersey colour. Triangulating each player's mask
+centre gives a motion anchor. On other frames, no masks or anchors are used.
+\item \textbf{Deform.} Fifty Adam iterations update each player's shared translation and local
+control offsets; the fused CUDA MLS operation moves the Gaussians. Background controls stay frozen,
+and the moving players are rendered over a cached background image.
+\item \textbf{Improve detail.} On nine frames out of ten, 100 iterations refine only the crops
+around moving players. Every tenth frame is a keyframe. First, a health check compares each
+player's rendered footprint with the repaired masks; a player whose overlap has fallen below
+0.10 IoU is re-initialized from its canonical shape at its anchor. Then 500 full-image iterations
+run with limited densification (at most 5\% more Gaussians per keyframe, and never more than 2 million
+in total), the Gaussians are re-bound to their controls, and the background
+cache is refreshed.
+\item \textbf{Record.} The current state is rendered for held-out views 13 and 26 and for the orbit
+camera and streamed to ffmpeg, so each video frame shows the scene at that instant. Every tenth
+frame, and at the last frame, all 24 held-out cameras are rendered and scored (PSNR, SSIM, LPIPS,
+and player-region PSNR); the training views also report mask IoU. Every 25 frames, the full
+Gaussian state is saved as a PLY checkpoint and the control trajectories and metrics are flushed
+to disk.
+\end{enumerate}
+After the last frame, the final state is saved and per-stage timings and quality statistics are
+summarized in \texttt{summary.json}. The held-out view-13 video and the orbit video are then
+published to \texttt{final\_renders/} with an \texttt{animated\_} prefix, marking them as renders
+of the moving scene rather than of one baked checkpoint.
+
+\subsection{What the run leaves on disk}
+The output directory keeps every intermediate product, so any step can be inspected or rerun:
+{\small\begin{verbatim}
+<out>/prepared_input/basketball/   undistorted frame-0 images and calibration
+<out>/basketball/
+    e2e_config.json, timings.json  resolved settings and step times
+    persons/ instances/ hulls/ ... Stage A intermediate results
+    canonical/                     editable frame-0 Gaussian scene + manifest
+    eval/                          frame-0 held-out scores and images
+    frames/ eval_frames/           decoded training and held-out frames
+    video_masks/ ball/             SAM2 masks and the ball trajectory
+    stage_b_v2/
+        metrics.json summary.json  per-frame metrics and the run summary
+        control_positions.npz      control-point trajectories for all frames
+        ply/frame_NNNNNN/          Gaussian checkpoints every 25 frames
+        videos/ final_renders/     held-out and orbit videos
+\end{verbatim}}
+
+\section{Results}
+\paragraph{How quality is measured.} Every score below comes from the 24 test cameras, which the
+model never trains on. We use four common image scores. \textbf{PSNR} (in dB) compares pixel
+colours; higher is better, and about 1~dB is a visible difference. \textbf{SSIM} (0 to 1) compares
+local structure such as edges; higher is better. \textbf{LPIPS} (0 to 1) is a learned measure of how
+different two images look to a person; lower is better. \textbf{Player PSNR} is PSNR measured only
+on the pixels around players, because players cover only about 4\% of each image and a full-image
+score is dominated by the static court and crowd. The test cameras are scored at every tenth video
+frame and at the last frame (69 frames). Each frame's score is the average over the 24 test cameras;
+the table then gives the average over those frames $\pm$ how much it varies from frame to frame.
+
+\begin{table}[!htbp]\centering
+\caption{Final quality on the 24 test cameras. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The frame-0 row
+scores the starting scene alone; its player score uses a different player-region definition, so it
+is not shown.}\label{tab:final-quality}
+\small\begin{tabular}{lrrrr}\toprule
+Result & PSNR & SSIM & LPIPS & Player PSNR \\\midrule
+Frame-0 scene (Stage A) & 20.08 & 0.679 & 0.229 & -- \\
+\textbf{Whole video, final method (2M cap)} & \textbf{20.43 $\pm$ 0.45} & \textbf{0.689 $\pm$ 0.016} & \textbf{0.230 $\pm$ 0.013} & \textbf{23.02 $\pm$ 1.89} \\
+\quad first half (frames 0--349) & 20.84 & -- & -- & 24.30 \\
+\quad second half (frames 350--699) & 20.03 & -- & -- & 21.78 \\
+Whole video, before the growth fix & 19.34 $\pm$ 1.49 & 0.675 $\pm$ 0.035 & 0.243 $\pm$ 0.031 & 23.70 $\pm$ 1.64 \\\bottomrule
+\end{tabular}\end{table}
+
+For comparison, ClipGStream reached 17.2--17.9~dB on the same 24 test cameras
+(Table~\ref{tab:clipgstream}), and it did so at a lower resolution ($960\times540$), which makes
+PSNR easier, and only on the first 10 frames. \method holds 20.43~dB on average over all 700 frames
+at $1920\times1080$.
+
+\subsection{What the test cameras see}
+Figure~\ref{fig:final-grid} shows the final method at an early frame (100) and a late, crowded frame
+(650). To avoid hand-picking flattering views, a script scores all 24 test cameras at that frame and
+shows the best, the median, and the worst. At frame 100 even the worst view is close to the real
+image. At frame 650 the court and crowd are still clean, but players in the crowded play near the
+far basket become blurred or broken up, and a few small floaters appear in the stands nearest the camera.
+This matches the numbers: the background holds up, while player quality drops in the second half
+(24.30 to 21.78~dB).
+\begin{figure}[!htbp]\centering
+\includegraphics[width=.9\linewidth,height=.78\textheight,keepaspectratio]{figures/heldout_grid_final_1080p.jpg}
+\caption{Final method: best, median, and worst test cameras at frames 100 and 650 (left: real image,
+right: render). \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames.}\label{fig:final-grid}
+\end{figure}
+
+\subsection{Results at native 4K}\label{sec:4k}
+The same pipeline also runs on the full $3840\times2160$ images. At 4K, the frame-0 build, keyframes,
+refinement, test scoring and videos all use native resolution, while the control points are fitted on
+$1920\times1080$ renders. Every threshold measured in pixels is doubled so it covers the same part of
+the scene. Data preparation uses the faster path from Section~\ref{sec:walkthrough}: JPEG frames,
+undistortion on the GPU, and SAM2 running on four cameras at once.
+
+\begin{table}[!htbp]\centering
+\caption{End-to-end time at native 4K. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test
+images at $3840\times2160$; 700 frames; 1.2 million-Gaussian budget; the GPU was not shared.}\label{tab:e2e-4k}
+\small\begin{tabular}{lr}\toprule
+Step & Wall-clock time \\\midrule
+Stage A: build the frame-0 scene & 17.7 min \\
+Decode 700 frames (JPEG, GPU undistortion) & 9.5 min \\
+SAM2 player masks, four cameras at once & 15.8 min \\
+Score frame 0, track the ball, load the scene & 12.3 min \\
+Track players and refine, 700 frames & 95.6 min \\\midrule
+\textbf{Total} & \textbf{$\approx$ 151 min} \\\bottomrule
+\end{tabular}\end{table}
+Tracking costs 7.1~s per frame, about 1.7 times the 1080p cost. The faster data path pays off:
+decoding four times as many pixels took 9.5~minutes, against 11.2 at 1080p on the old path, and SAM2
+took 15.8 instead of 31.2~minutes. Peak GPU memory was 47.8~GB while four SAM2 processes and the GPU
+decoder ran together, and 12.5~GB during tracking.
+
+Scores measured at 4K are not comparable with scores measured at 1080p, because a sharper target is
+harder to match. For a fair comparison, Table~\ref{tab:fair4k} draws every final model from the same
+24 test cameras at $1920\times1080$ and scores it against the same images.
+\begin{table}[!htbp]\centering
+\caption{1080p versus 4K training, scored on identical test images. \textbf{Setup:} RTX PRO 6000; each
+model drawn at $1920\times1080$ from the 24 test cameras at every 50th frame (13 frames) and compared
+with the same $1920\times1080$ images.}\label{tab:fair4k}
+\small\begin{tabular}{lrrrr}\toprule
+Model & PSNR & SSIM & LPIPS & End-to-end time \\\midrule
+\textbf{Trained at 1080p, 2M cap (final)} & \textbf{20.44} & \textbf{0.689} & \textbf{0.230} & \textbf{$\approx$ 119 min} \\
+Trained at 4K, 1.2M cap & 19.74 & 0.663 & 0.253 & $\approx$ 151 min \\
+Trained at 4K, 3M cap & 19.30 & 0.655 & 0.265 & -- \\\bottomrule
+\end{tabular}\end{table}
+Training at 4K was both slower and worse on new views. The larger images show finer detail, but
+still from the same 12 viewpoints, so the extra detail is mostly fitted to those views and does not
+carry over to new ones. A larger budget did not help: as at 1080p, 3 million Gaussians brought back
+floaters, and the 4K 3 million model fell to 18.3~dB at frame 650. The 4K settings were not tuned
+beyond doubling the pixel thresholds, so 4K might do better with its own tuning, but on this evidence
+the half-resolution working copy is the better choice on both speed and quality. The native-resolution
+renders do show that the static scene holds real 4K detail (Figure~\ref{fig:4kcrop}).
+\begin{figure}[!htbp]\centering
+\includegraphics[width=\linewidth]{figures/4k_native_crop_f300_f650.jpg}
+\caption{A $1920\times1080$ crop of the native 4K render from test camera 13 at frames 300 (left) and
+650 (right). Crowd faces, the scoreboard and the court lettering are sharp; late in the game, players
+in the crowded play under the basket are ghosted. \textbf{Setup:} RTX PRO 6000; trained at
+$3840\times2160$ with a 1.2 million-Gaussian budget.}\label{fig:4kcrop}
+\end{figure}
+
+\subsection{Earlier development results}
+Table~\ref{tab:dev} records how the method improved during development on the RTX 3080, before the
+final PRO 6000 runs. These runs used a slightly different undistorted image size, so their numbers are
+close to, but not directly comparable with, Table~\ref{tab:final-quality}.
+\begin{table}[!htbp]\centering
+\caption{Development history. \textbf{Setup:} all rows RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted); scores are averages over the 24 test cameras unless the last column says otherwise. Test frames are every tenth video frame, which are also keyframes.}\label{tab:dev}
+\begin{tabular}{lrrrr}\toprule
+Method & Full PSNR & Person PSNR & Person IoU & Measurement \\\midrule
+Global 3DGS baseline & 17.50 & -- & -- & frame-0 test \\
+Stage A canonical & 19.32 & 18.34 & 0.788 & frame-0 test \\
+Stage B v1 & 18.29 & 15.00 & 0.70$\rightarrow$0.30 & keyframe test mean \\
+Stage B v2 (old) & 18.87 & 19.62 & 0.71$\rightarrow$0.39 & keyframe test mean \\
+Focused refinement, frames 1--20 & 22.42 & 26.76 & 0.746 & training-view mean \\
+300-frame diagnostic & 20.07 & 22.44 & -- & test mean \\\bottomrule
+\end{tabular}\end{table}
+
+\begin{figure}[!htbp]\centering
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_gt_f200.png}\\\small Ground truth, view 13, frame 200
+\end{minipage}\hfill
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_v2_f200.png}\\\small Earlier Stage B v2
+\end{minipage}\hfill
+\begin{minipage}[b]{.32\linewidth}\centering
+\includegraphics[width=\linewidth]{figures/view13_courtflow_f200.png}\\\small CourtFlow-GS diagnostic
+\end{minipage}
+\caption{The same test camera (view 13) at frame 200 during development. \textbf{Setup:} RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted).}
+\end{figure}
+
+\subsection{Why these design choices were selected}
+The method was not chosen by adding complexity for its own sake. Table~\ref{tab:choices} records
+the practical failures we observed and the smallest change that addressed each one. These are useful
+trade-offs: some choices improve quality and speed at the same time by avoiding work on irrelevant
+pixels, while others deliberately spend more computation only where player detail needs it.
+\begin{table}[!htbp]\centering
+\caption{Design choices and the observation behind each one. \textbf{Setup:} observations from development runs on the RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted); the last row comes from the final RTX PRO 6000 runs at $1920\times1080$.}\label{tab:choices}
+\small\begin{tabular}{p{.31\linewidth}p{.61\linewidth}}\toprule
+Choice & Why it was selected \\\midrule
+3D-first identities & Matching 2D centres and colours independently fragmented 68 masks into 60 apparent people. Building rough 3D components first gives the same player one ID across cameras. \\
+Occlusion-aware hull & A strict silhouette intersection removed hidden limbs. Allowing arbitrary misses inflated a hull by about $2.5\times$. Measured nearer depth supplies the middle ground. \\
+Masked MASt3R crops & Full-frame descriptors reduce a small player to about $6\times25$ pixels and produced star-shaped rays. Crops spend the fixed descriptor resolution on the player instead of the court. \\
+Same-group MLS controls & A global control graph lets nearby teammates pull each other. Fixed same-player control neighbours keep motions separate and also make deformation cheap. \\
+Shared translation plus local offsets & Moving every control alone reached 0.60 IoU by frame 10; shared translation plus local articulation reached 0.71 IoU. \\
+Crop refinement plus keyframes & Full-image updates mostly optimize static court pixels. Player crops improve moving detail cheaply; full keyframes occasionally correct accumulated error and add splats. \\
+Growth cap (found on the PRO 6000) & Uncapped keyframe growth compounded to 6.86M Gaussians and 16.1~dB by frame 699. Capping the total at 2 million Gaussians ended at 19.6~dB, was faster, and scored best of the budgets tried (1.1M, 2M, 3M). \\\bottomrule
+\end{tabular}\end{table}
+
+\subsection{Evaluation protocol and deliverables}
+The 12 training cameras are never used to judge quality. At every tenth frame and at the last frame,
+the tracker renders all 24 test cameras and compares them with the real images from those cameras.
+Nothing about the method was tuned on the test cameras except the growth cap, which was chosen from a
+short 300-frame comparison; its effect on the full video is reported above.
+
+The run writes two animated videos while it tracks: a test-camera video (view 13) and a camera that
+orbits the court. Each video frame is drawn from the scene exactly as it was at that moment of the
+game. The final results folder also keeps the editable frame-0 scene (79~MB), the control-point paths
+for all 700 frames (113~MB), and the final scene state (208~MB, 2.0 million Gaussians). A single
+saved state is one instant of the game, not the whole video: storing every frame naively would take
+about $700\times208$~MB $\approx$ 146~GB, so a practical package would store the frame-0 scene plus the
+per-frame motion in compressed form.
+
+\section{Runtime}
+\subsection{The full 700-frame run}
+Table~\ref{tab:e2e} shows where the time goes in one complete run of the final method on the RTX PRO
+6000, from the raw videos to finished novel-view videos.
+\begin{table}[!htbp]\centering
+\caption{End-to-end time for the final method. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The tracking row is
+the final run with the 2 million cap; the steps before it do not depend on the cap and were
+measured in the first 700-frame run.}\label{tab:e2e}
+\small\begin{tabular}{lr}\toprule
+Step & Wall-clock time \\\midrule
+Prepare input (undistort frame 0) & 0.3 min \\
+Stage A: build and score the frame-0 scene & 9.9 min \\
+Decode 700 frames from 36 videos & 11.2 min \\
+SAM2 player masks, 12 cameras one after another & 31.2 min \\
+Track the ball & 10.7 min \\
+Track players and refine, 700 frames (incl.\ test scoring and videos) & 55.3 min \\\midrule
+\textbf{Total} & \textbf{$\approx$ 119 min} \\\bottomrule
+\end{tabular}\end{table}
+Tracking itself costs 4.27~s per video frame (0.23 frames per second): 1.48~s moving control points,
+1.37~s refining player crops on nine frames out of ten, 8.13~s for each tenth-frame keyframe, and
+0.75~s (averaged) for masks and identity repair. For a few minutes this run shared the GPU with a
+scoring job, so these times are slightly pessimistic. Peak GPU memory was 7.2~GB with the 1.1 million
+cap and 12.1~GB with no cap; the 2 million run was not measured on its own. Almost half of the time
+before tracking is spent on data preparation rather than reconstruction; Section~\ref{sec:4k} measures
+the faster data path (JPEG frames, GPU undistortion, and SAM2 on four cameras at once) used for the
+4K run.
+
+\paragraph{Novel-view rendering (inference).} Drawing a tracked frame from a new camera takes about
+3.0~ms at 1080p and 3.8~ms at 4K for the final 2 million-Gaussian scene on the RTX PRO 6000;
+Section~\ref{sec:inference} covers inference in detail.
+
+\subsection{RTX 3080 versus RTX PRO 6000}
+\begin{table}[!htbp]\centering
+\caption{The same work on both GPUs. \textbf{Setup:}
+RTX 3080 (12 GB) with training images at $1874\times1054$ and tracking renders at $937\times527$;
+RTX PRO 6000 (96 GB) with training images at $1920\times1080$ and tracking renders at $960\times540$.
+The PRO 6000 handles 5\% more pixels, so its speed-ups are slightly understated. Both GPUs ran the
+same settings, including the 3D identity repair. The Stage A row is the whole frame-0 build. The
+Stage B rows average video frames 2--29 (28 frames, two keyframes) on both GPUs; frame 1 is left out
+because the 3080 spent 159~s compiling its CUDA code there, which the PRO 6000 does ahead of time.
+The raster row draws the \emph{same} saved 3080 scene (2.0 million Gaussians) on both GPUs at
+$937\times527$.}\label{tab:runtime}
+\small\begin{tabular}{lrrr}\toprule
+Component & RTX 3080 12 GB & RTX PRO 6000 & Speed-up \\\midrule
+Stage A frame-0 canonical build & 1896 s & 528 s & 3.6$\times$ \\
+MLS deformation/control optimization & 2.75 s/frame & 1.28 s/frame & 2.1$\times$ \\
+\quad of which fused MLS forward & 0.072 s/frame & 0.029 s/frame & 2.5$\times$ \\
+Focused crop refinement (100 iterations) & 3.04 s/non-keyframe & 0.92 s/non-keyframe & 3.3$\times$ \\
+500-step full keyframe & 23.02 s/keyframe & 5.75 s/keyframe & 4.0$\times$ \\
+Mask refresh with identity repair, amortized & 1.83 s/frame & 1.02 s/frame & 1.8$\times$ \\
+Stage B total & 9.05 s/frame (0.110 FPS) & 3.57 s/frame (0.280 FPS) & 2.5$\times$ \\
+Colour + raster of a saved scene, 937$\times$527 & 4.36 ms (229 FPS) & 2.20 ms (455 FPS) & 2.0$\times$ \\\bottomrule
+\end{tabular}\end{table}
+
+The fused MLS/SVD calculation is only a small part of tracking time; drawing the Gaussians and
+computing gradients through that drawing dominate. The PRO 6000 gains most where the work is large:
+keyframes are $4.0\times$ faster and crop refinement $3.3\times$. Moving control points gains less
+($2.1\times$); each of its 50 steps draws only four small, half-resolution cameras, which likely
+leaves much of the larger GPU idle. Mask refresh gains least ($1.8\times$) because part of the
+identity repair runs on the CPU.
+
+\section{Inference: showing the reconstruction to a viewer}\label{sec:inference}
+Reconstruction (Stages A and B) is the slow, one-off part. Showing the result needs no training and
+none of the neural networks used earlier (SAM2, MASt3R, the person detector). To draw one moment of
+the game from any camera, only two steps run on the GPU:
+\begin{enumerate}
+\item \textbf{Bake} the moment: move every Gaussian to where it is at that frame. The control points
+store the motion; one fused CUDA kernel applies it (the same MLS step used during tracking).
+\item \textbf{Draw}: evaluate each Gaussian's colour for the viewing direction and rasterize (splat)
+the Gaussians into the image.
+\end{enumerate}
+
+\begin{table}[!htbp]\centering
+\caption{Inference cost per frame. \textbf{Setup:} RTX PRO 6000 (96 GB), idle GPU, CUDA-synchronized
+timing averaged over 300 frames (drawing) or 20 repeats (baking); video encoding excluded.}\label{tab:inference}
+\small\begin{tabular}{lrr}\toprule
+Step & Scene & Time per frame \\\midrule
+Bake (move all Gaussians with 15{,}352 control points) & 2.0M Gaussians & 0.9--2.2 ms \\
+Draw at $1920\times1080$ & 1.10M Gaussians & 2.20 ms (455 FPS) \\
+Draw at $3840\times2160$ & 1.10M Gaussians & 2.94 ms (341 FPS) \\
+Draw at $1920\times1080$ & 2.0M Gaussians (final) & 2.96 ms (338 FPS) \\
+Draw at $3840\times2160$ & 2.0M Gaussians (final) & 3.82 ms (262 FPS) \\\bottomrule
+\end{tabular}\end{table}
+Baking plus drawing the final scene therefore takes about 4--6~ms, far faster than real time: the video itself
+runs at 25 frames per second (40~ms per frame).
+
+\subsection{Playback package and command}
+The release playback path is deliberately forward-only: it reads pre-exported Gaussian parameters,
+evaluates view-dependent colour, and rasterizes. It does not load SAM2, MASt3R, a detector, an
+optimizer, or the tracking code. During a tracking run, pass
+	exttt{--set v2\_export\_playback=true} to write a package with one dynamic Gaussian file per
+frame and a background file at each keyframe. A viewer
+can then render an unseen physical camera or benchmark the draw path with:
+\begin{verbatim}
+python -m ring_init.play --package playback/ --camera view:13 \
+  --frames 0:700 --out view13.mp4
+python -m ring_init.play --package playback/ --camera view:13 --benchmark
+\end{verbatim}
+The package's \texttt{meta.json} records the calibration, frame range, FPS, and format version.
+Each compressed \texttt{.npz} contains only rendering parameters: means, rotations, log-scales,
+opacity logits, degree-0/1 colour coefficients, and instance IDs. The player file for the selected
+frame is combined with the most recent background keyframe. This makes playback independent of the
+training stack and makes file loading, drawing, and video encoding separately measurable.
+
+\subsection{Two ways to serve viewers}
+Delivering this to many people is closer to streaming a video game than to running a neural
+network, and the two standard game-streaming designs both apply.
+\paragraph{Render on the server (like cloud gaming).} The viewer sends where their virtual camera
+is; a server GPU bakes and draws that view, encodes it with the GPU's video encoder, and streams
+ordinary video back. Any device can watch, and the bandwidth is that of normal video. The costs are
+a network round trip whenever the viewer moves the camera (tens of milliseconds) and GPU time per
+viewer. Three things make this efficient at scale: bake each moment once and share it between all
+viewers watching that moment (baking is per game frame, drawing is per viewer); draw several
+viewers' cameras in one rasterizer call; and hand finished frames straight from GPU memory to the
+video encoder. Our current exporter instead copies every frame to the CPU and pipes it to ffmpeg,
+which is now its slowest step.
+\paragraph{Render on the viewer's device (like downloading game assets).} The server only sends
+the compressed package above, and the viewer's GPU bakes and draws. Camera moves are instant and
+server cost is little more than a content-delivery network, but the viewer needs a capable GPU:
+2 million Gaussians is heavy for a phone. The usual fix from games is level of detail: send fewer,
+larger Gaussians for distant or less important parts of the scene. A service would likely use both,
+with server rendering for weak devices and local rendering for strong ones.
+
+\subsection{Why ``just compile it'' does not work here}
+Tools such as TensorRT speed up neural networks by optimizing a fixed graph of large, regular
+operations (matrix multiplications, convolutions) whose sizes are known in advance. Gaussian
+splatting is not like that. Every frame it projects the Gaussians, sorts them by depth within each
+small screen tile, and blends them front to back, and how many Gaussians land in each tile changes
+with every camera and every moment of the game. The work is dominated by sorting and irregular
+memory access in custom CUDA kernels, which such compilers cannot express or improve. Speed-ups
+therefore come from engineering the renderer itself, as game engines do:
+\begin{itemize}
+\item \textbf{Fuse steps.} Baking is already a single kernel; folding the colour evaluation into it
+would remove another pass over all Gaussians.
+\item \textbf{Remove launch overhead} by recording the whole bake-and-draw sequence once as a CUDA
+graph and replaying it every frame.
+\item \textbf{Reuse work across frames.} Consecutive frames are nearly identical, so the previous
+depth order is an excellent starting point for the next sort.
+\item \textbf{Skip what is not visible}: drop Gaussians outside the camera's view before sorting,
+and use coarser detail far away.
+\item \textbf{Port the renderer} to Vulkan or WebGPU compute shaders so it runs in game engines and
+web browsers, where client-side viewing would happen.
+\end{itemize}
+
+\section{Can the method use fewer cameras?}
+We did not rebuild the full pipeline with fewer than 12 cameras, but two measurements indicate where
+the limit is. First, when one training camera was removed (leaving a $60^\circ$ gap), player PSNR
+seen from that gap fell from 18.3 to 17.0~dB, so a single wider gap already costs about 1.3~dB.
+Second, the method finds each player in 3D by asking at least four cameras to agree. With 12 cameras
+($30^\circ$ apart) most players are seen by enough cameras; with 6 ($60^\circ$ apart) many players
+would be seen well by only two or three, and identities would start to fail. Our estimate is that
+9 cameras ($40^\circ$ apart) is the practical minimum for this design, at a cost of roughly 1~dB,
+while 6 would need a stronger shape prior, for example a learned human body model, to replace the
+missing views.
+
+\section{Limitations and next steps}
+\begin{itemize}
+\item \textbf{Players in crowded plays.} Player tracking still degrades late in the video. The
+training-camera mask overlap falls from 0.52 at frame 100 to about 0.16 after frame 600, and the
+method needed 205 recoveries, where a lost player is reset from its frame-0 shape. Player PSNR drops
+from 24.30~dB in the first half to 21.78~dB in the second. The next step is to reduce these
+recoveries, for example by tracking players jointly when they overlap instead of one at a time.
+\item \textbf{A few thin floaters.} Some long, thin Gaussians near the cameras still show up as
+streaks in a few test views. Limiting how elongated a new Gaussian may become would target them.
+\item \textbf{Data preparation time.} Decoding and masking take almost as long as tracking at
+1080p. The faster data path used for 4K should be made the default at every resolution.
+\item \textbf{Storage.} A compact package (frame-0 scene plus compressed per-frame motion) is needed
+to ship the whole video instead of one state per frame.
+\end{itemize}
+
+\paragraph{Model-size diagnostic.}
+The final 2-million-Gaussian budget was selected because it avoids the late-video floaters caused
+by unconstrained keyframe growth while retaining player detail. The complete growth-cap ablation,
+per-player comparison, and failure visualizations are deferred to Appendix~\ref{app:failure}.
+
+\appendix
+
+\section{Detailed methodology}\label{app:method}
 Before doing anything else, every image is undistorted. This removes lens bending, so a straight
 camera ray in the mathematics corresponds to a straight ray in the image. In the notation used
 later, camera $c$ is $P_c=K_c[R_c\mid t_c]$, with world-to-camera conversion $x_c=R_cx+t_c$.
@@ -153,7 +652,7 @@ corrections are kept fixed.
 \paragraph{Masks and 3D identities:}
 Photometric reconstruction alone is too ambiguous for the moving players. Each player occupies a
 small portion of a frame, shares colour and texture with teammates, and is frequently overlapped
-by another player or various structures / elements in the scene. 
+by another player or various structures / elements in the scene.
 Foreground masks tell the system both ``which pixels belong to this person for geometry matching''
 and ``where this person is allowed to appear when rendered.''
 This prevents background splats from being absorbed into players and prevents players from
@@ -302,12 +801,7 @@ Here the image term matches appearance, BCE matches each player's rendered mask,
 local shape, acceleration discourages sudden jitter, and the anchor discourages global drift.
 Background controls stay frozen while the moving splats are rendered over a cached background.
 
-\begin{figure}[H]
-\centering
-\includegraphics[width=\linewidth,height=4.0in,keepaspectratio]{figures/courtflow_gs_pipeline.pdf}
-\caption{CourtFlow-GS pipeline. The editable diagram source is distributed with the report as
-\texttt{courtflow\_gs\_pipeline.drawio}.}
-\end{figure}
+
 
 \subsection{Focused refinement}
 MLS provides stable, smooth motion, but deliberately does not change a Gaussian's colour, size, or
@@ -358,148 +852,9 @@ and improve either player crops or a periodic full keyframe.
 \end{algorithmic}
 \end{algorithm}
 
-\section{Execution Walkthrough}\label{sec:walkthrough}
-The previous section explains \emph{why} each part of the method exists. This section follows one
-complete run from the raw capture to the final videos: which program runs, what it reads, what it
-writes, and where time is spent. Everything is started by a single command,
-\begin{verbatim}
-python -m ring_init.e2e --scene basketball --dataset-dir <capture> \
-    --config config.local.json --out-dir <out> --frames 0:700
-\end{verbatim}
-where the capture directory holds the 36 videos (\texttt{cameras/view\_XXX.mp4}) and the COLMAP
-calibration (\texttt{calibration/}). The local configuration only names the SAM2 checkpoint; all
-other settings are the defaults, and the exact resolved configuration is written to
-\texttt{e2e\_config.json} in the output directory before any work starts. Every step writes a completion
-marker (\texttt{done.json}) next to its output, so an interrupted run resumes where it stopped and
-\texttt{--force step} recomputes a single step. The times below were measured on the RTX PRO 6000.
+\FloatBarrier
 
-\subsection{Preparing the input (17 s)}
-The capture adapter reads the calibration for all 36 cameras, decodes frame 0 of every video with
-ffmpeg (Lanczos resampling from $3840\times2160$ to the $1920\times1080$ working resolution), and
-removes lens distortion with OpenCV so every camera becomes an ideal pinhole camera. Every third
-view is copied as the 12 training images \texttt{cam\_00}\ldots\texttt{cam\_11}; all 36 undistorted
-frame-0 images are kept for held-out evaluation. The adapter also writes the 12-camera and
-36-camera calibration files used by the rest of the pipeline.
-
-\subsection{Stage A: building the frame-0 scene ($\approx$9 min)}
-Stage A runs the steps of Table~\ref{tab:stage-a} in order. Each step caches its result on disk,
-and later steps only read those files, so the steps are independent programs joined by files.
-\begin{table}[H]\centering
-\caption{Stage A steps and their wall-clock times. \textbf{Setup:} RTX PRO 6000 (96 GB); frame 0 of the 12 training cameras at $1920\times1080$; timed during the 700-frame run.}\label{tab:stage-a}
-\small\begin{tabular}{p{.13\linewidth}p{.52\linewidth}p{.18\linewidth}r}\toprule
-Step & What runs & Writes & Time \\\midrule
-\texttt{calib} & Loads the 12 training cameras and images; draws the camera layout. & \texttt{calib/} & 2.1 s \\
-\texttt{match\_full} & MASt3R matches neighbouring ring cameras on whole frames (512 px). & 3D points & 33.4 s \\
-\texttt{floor} & RANSAC fits the court plane and its extent; fixes metric scale. & floor plane & 0.3 s \\
-\texttt{persons} & Faster R-CNN person boxes, then SAM2 masks, in every training camera. & per-camera masks & 11.7 s \\
-\texttt{instances} & Carves the court volume with all masks; 3D blobs become player IDs; re-prompts SAM2 for missing views. & label images $L_c$ & 16.7 s \\
-\texttt{hulls} & Occlusion-aware visual hull for every player. & voxel hulls & 4.3 s \\
-\texttt{match\_crops} & MASt3R on masked player crops for nearby camera pairs. & player points & 46.9 s \\
-\texttt{fuse} & Merges crop matches and hull fill into coloured seed clouds. & seed \texttt{.ply} & 5.6 s \\
-\texttt{train} & Optimizes each player's Gaussians, then the background with players composited in front. & Gaussian models & 406.9 s \\
-\texttt{export} & Copies the trained models into a canonical package with a manifest. & \texttt{canonical/} & $<$1 s \\
-\texttt{eval} & Renders frame 0 for all 24 held-out cameras and scores it. & \texttt{eval/} & -- \\\bottomrule
-\end{tabular}\end{table}
-Training is the only substantial cost. The detector, SAM2, and MASt3R networks are freed from GPU
-memory once their steps finish, so none of them competes with Gaussian training for memory.
-
-\subsection{Stage B, part 1: decoding the sequence}
-Before tracking starts, Stage B prepares all per-frame data. Six worker processes each stream one
-camera's video through ffmpeg and apply exactly the frame-0 preprocessing: the same resampling, the
-same precomputed undistortion map, and the same per-camera colour correction. The 12 training
-cameras are decoded at every frame (8400 images for 700 frames). The 24 held-out cameras are
-decoded only at every tenth frame, because they are used only for scoring. Frames are stored as
-lightly compressed PNG files, and already decoded frames are skipped on a rerun.
-
-SAM2 then runs once per training camera in video mode. It is prompted with that camera's frame-0
-player labels from Stage A and follows every player through the whole sequence. These raw masks
-are not trusted as they are: SAM2 treats each camera separately and can swap two players in one
-camera but not another. Identities are therefore repaired in 3D during tracking (below). Finally,
-the ball is detected and triangulated at frame 0, tracked causally through the sequence with a
-gravity and bounce model, and added to the canonical scene as its own small group of Gaussians.
-
-\subsection{Stage B, part 2: the per-frame loop}
-The canonical Gaussians are loaded onto the GPU once and stay there for the whole sequence. Control
-points are placed on every group (1024 per player, 16 on the ball, 1000 on the background), and each
-Gaussian is bound to its eight nearest same-group controls. Then, for every frame $f$:
-\begin{enumerate}
-\item \textbf{Load.} A background thread has already read frame $f$'s 12 training images from disk
-while the GPU was busy with frame $f-1$. The images are downsampled to the tracking resolution
-($960\times540$) and uploaded; the full-resolution copies are kept for refinement.
-\item \textbf{Masks and anchors (every fifth frame).} The SAM2 masks for frame $f$ are read, their
-identities are rebuilt in 3D exactly as in Stage A's \texttt{instances} step, and the repaired masks
-are matched to the tracked players by position and jersey colour. Triangulating each player's mask
-centre gives a motion anchor. On other frames, no masks or anchors are used.
-\item \textbf{Deform.} Fifty Adam iterations update each player's shared translation and local
-control offsets; the fused CUDA MLS operation moves the Gaussians. Background controls stay frozen,
-and the moving players are rendered over a cached background image.
-\item \textbf{Improve detail.} On nine frames out of ten, 100 iterations refine only the crops
-around moving players. Every tenth frame is a keyframe. First, a health check compares each
-player's rendered footprint with the repaired masks; a player whose overlap has fallen below
-0.10 IoU is re-initialized from its canonical shape at its anchor. Then 500 full-image iterations
-run with limited densification (at most 5\% more Gaussians per keyframe, and never more than 2 million
-in total), the Gaussians are re-bound to their controls, and the background
-cache is refreshed.
-\item \textbf{Record.} The current state is rendered for held-out views 13 and 26 and for the orbit
-camera and streamed to ffmpeg, so each video frame shows the scene at that instant. Every tenth
-frame, and at the last frame, all 24 held-out cameras are rendered and scored (PSNR, SSIM, LPIPS,
-and player-region PSNR); the training views also report mask IoU. Every 25 frames, the full
-Gaussian state is saved as a PLY checkpoint and the control trajectories and metrics are flushed
-to disk.
-\end{enumerate}
-After the last frame, the final state is saved and per-stage timings and quality statistics are
-summarized in \texttt{summary.json}. The held-out view-13 video and the orbit video are then
-published to \texttt{final\_renders/} with an \texttt{animated\_} prefix, marking them as renders
-of the moving scene rather than of one baked checkpoint.
-
-\subsection{What the run leaves on disk}
-The output directory keeps every intermediate product, so any step can be inspected or rerun:
-{\small\begin{verbatim}
-<out>/prepared_input/basketball/   undistorted frame-0 images and calibration
-<out>/basketball/
-    e2e_config.json, timings.json  resolved settings and step times
-    persons/ instances/ hulls/ ... Stage A intermediate results
-    canonical/                     editable frame-0 Gaussian scene + manifest
-    eval/                          frame-0 held-out scores and images
-    frames/ eval_frames/           decoded training and held-out frames
-    video_masks/ ball/             SAM2 masks and the ball trajectory
-    stage_b_v2/
-        metrics.json summary.json  per-frame metrics and the run summary
-        control_positions.npz      control-point trajectories for all frames
-        ply/frame_NNNNNN/          Gaussian checkpoints every 25 frames
-        videos/ final_renders/     held-out and orbit videos
-\end{verbatim}}
-
-\section{Results}
-\paragraph{How quality is measured.} Every score below comes from the 24 test cameras, which the
-model never trains on. We use four common image scores. \textbf{PSNR} (in dB) compares pixel
-colours; higher is better, and about 1~dB is a visible difference. \textbf{SSIM} (0 to 1) compares
-local structure such as edges; higher is better. \textbf{LPIPS} (0 to 1) is a learned measure of how
-different two images look to a person; lower is better. \textbf{Player PSNR} is PSNR measured only
-on the pixels around players, because players cover only about 4\% of each image and a full-image
-score is dominated by the static court and crowd. The test cameras are scored at every tenth video
-frame and at the last frame (69 frames). Each frame's score is the average over the 24 test cameras;
-the table then gives the average over those frames $\pm$ how much it varies from frame to frame.
-
-\begin{table}[H]\centering
-\caption{Final quality on the 24 test cameras. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The frame-0 row
-scores the starting scene alone; its player score uses a different player-region definition, so it
-is not shown.}\label{tab:final-quality}
-\small\begin{tabular}{lrrrr}\toprule
-Result & PSNR & SSIM & LPIPS & Player PSNR \\\midrule
-Frame-0 scene (Stage A) & 20.08 & 0.679 & 0.229 & -- \\
-\textbf{Whole video, final method (2M cap)} & \textbf{20.43 $\pm$ 0.45} & \textbf{0.689 $\pm$ 0.016} & \textbf{0.230 $\pm$ 0.013} & \textbf{23.02 $\pm$ 1.89} \\
-\quad first half (frames 0--349) & 20.84 & -- & -- & 24.30 \\
-\quad second half (frames 350--699) & 20.03 & -- & -- & 21.78 \\
-Whole video, before the growth fix & 19.34 $\pm$ 1.49 & 0.675 $\pm$ 0.035 & 0.243 $\pm$ 0.031 & 23.70 $\pm$ 1.64 \\\bottomrule
-\end{tabular}\end{table}
-
-For comparison, ClipGStream reached 17.2--17.9~dB on the same 24 test cameras
-(Table~\ref{tab:clipgstream}), and it did so at a lower resolution ($960\times540$), which makes
-PSNR easier, and only on the first 10 frames. \method holds 20.43~dB on average over all 700 frames
-at $1920\times1080$.
-
-\subsection{A failure that only appears late in the video}
+\section{Late-video failure analysis}\label{app:failure}
 Development runs covered at most 300 frames. The first full 700-frame run on the RTX PRO 6000
 revealed a problem that shorter runs could not show (Figure~\ref{fig:drift}, orange). Each keyframe
 may add up to 5\% more Gaussians to add detail. That rule compounds: after 70 keyframes the scene had
@@ -537,7 +892,7 @@ better in most views (it wins on 31 of 44 test frames); pooling every player pix
 a few views where players are badly wrong, usually where a returning floater crosses a player. In
 short, 3 million gives sharper players in typical views, but less reliable players and a worse
 background, so 2 million remains the better overall choice.
-\begin{table}[H]\centering
+\begin{table}[!htbp]\centering
 \caption{Player PSNR per person on the 24 test cameras, frames 300--650 (the saved full states that
 record which Gaussian belongs to whom). Each person's region is where either run draws that person
 (footprint weight $>0.05$, widened by 6 pixels), so both runs are scored on identical pixels. The 14
@@ -566,7 +921,7 @@ Compared with no cap, the final method is faster (4.27 instead of 4.87~s per fra
 of 2 million instead of 6.86 million Gaussians, and scores 1.09~dB higher on the test cameras over
 the whole video. This is the speed-and-quality trade-off the assignment asks about, and here one
 change improves both. The price is 0.7~dB of player PSNR.
-\begin{table}[H]\centering
+\begin{table}[!htbp]\centering
 \caption{Scene-size budget, whole video. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Averages over the 69
 test frames (each the mean of the 24 test cameras). $^\ast$The 3 million run shared the GPU with another run, so its time is inflated. $^\dagger$Player PSNR here is computed per test camera over all players together and then averaged over cameras; Table~\ref{tab:per-player} scores each player separately.}\label{tab:budget}
 \small\begin{tabular}{lrrrrrr}\toprule
@@ -576,231 +931,20 @@ Uncapped & 6.86M & 19.34 & 0.675 & 0.243 & 23.70 & 4.87 \\
 2 million & 2.00M & \textbf{20.43} & \textbf{0.689} & \textbf{0.230} & 23.02 & 4.27 \\
 3 million & 3.00M & 20.11 & 0.686 & 0.233 & 23.31 & 6.68$^\ast$ \\\bottomrule
 \end{tabular}\end{table}
-\begin{figure}[H]\centering
+\begin{figure}[!htbp]\centering
 \includegraphics[width=.86\linewidth]{figures/growth_cap_drift.pdf}
 \caption{Test PSNR (top) and scene size (bottom) over the video: no cap, a cap at 1.5 times the frame-0 size (1.1 million Gaussians), and a cap at 2 million Gaussians.
 \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Each point is the average over the 24 test cameras.}\label{fig:drift}
 \end{figure}
-\begin{figure}[H]\centering
+\begin{figure}[!htbp]\centering
 \includegraphics[width=.9\linewidth,height=.5\textheight,keepaspectratio]{figures/heldout_grid_uncapped_f650.jpg}
 \caption{Before the fix, frame 650: the best, median, and worst test cameras (left: real image,
 right: render). The worst view is covered by a large dark floater. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames.}\label{fig:uncapped-grid}
 \end{figure}
 
-\subsection{What the test cameras see}
-Figure~\ref{fig:final-grid} shows the final method at an early frame (100) and a late, crowded frame
-(650). To avoid hand-picking flattering views, a script scores all 24 test cameras at that frame and
-shows the best, the median, and the worst. At frame 100 even the worst view is close to the real
-image. At frame 650 the court and crowd are still clean, but players in the crowded play near the
-far basket become blurred or broken up, and a few small floaters appear in the stands nearest the camera.
-This matches the numbers: the background holds up, while player quality drops in the second half
-(24.30 to 21.78~dB).
-\begin{figure}[H]\centering
-\includegraphics[width=.9\linewidth,height=.78\textheight,keepaspectratio]{figures/heldout_grid_final_1080p.jpg}
-\caption{Final method: best, median, and worst test cameras at frames 100 and 650 (left: real image,
-right: render). \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames.}\label{fig:final-grid}
-\end{figure}
+\FloatBarrier
 
-\subsection{Results at native 4K}\label{sec:4k}
-The same pipeline also runs on the full $3840\times2160$ images. At 4K, the frame-0 build, keyframes,
-refinement, test scoring and videos all use native resolution, while the control points are fitted on
-$1920\times1080$ renders. Every threshold measured in pixels is doubled so it covers the same part of
-the scene. Data preparation uses the faster path from Section~\ref{sec:walkthrough}: JPEG frames,
-undistortion on the GPU, and SAM2 running on four cameras at once.
-
-\begin{table}[H]\centering
-\caption{End-to-end time at native 4K. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test
-images at $3840\times2160$; 700 frames; 1.2 million-Gaussian budget; the GPU was not shared.}\label{tab:e2e-4k}
-\small\begin{tabular}{lr}\toprule
-Step & Wall-clock time \\\midrule
-Stage A: build the frame-0 scene & 17.7 min \\
-Decode 700 frames (JPEG, GPU undistortion) & 9.5 min \\
-SAM2 player masks, four cameras at once & 15.8 min \\
-Score frame 0, track the ball, load the scene & 12.3 min \\
-Track players and refine, 700 frames & 95.6 min \\\midrule
-\textbf{Total} & \textbf{$\approx$ 151 min} \\\bottomrule
-\end{tabular}\end{table}
-Tracking costs 7.1~s per frame, about 1.7 times the 1080p cost. The faster data path pays off:
-decoding four times as many pixels took 9.5~minutes, against 11.2 at 1080p on the old path, and SAM2
-took 15.8 instead of 31.2~minutes. Peak GPU memory was 47.8~GB while four SAM2 processes and the GPU
-decoder ran together, and 12.5~GB during tracking.
-
-Scores measured at 4K are not comparable with scores measured at 1080p, because a sharper target is
-harder to match. For a fair comparison, Table~\ref{tab:fair4k} draws every final model from the same
-24 test cameras at $1920\times1080$ and scores it against the same images.
-\begin{table}[H]\centering
-\caption{1080p versus 4K training, scored on identical test images. \textbf{Setup:} RTX PRO 6000; each
-model drawn at $1920\times1080$ from the 24 test cameras at every 50th frame (13 frames) and compared
-with the same $1920\times1080$ images.}\label{tab:fair4k}
-\small\begin{tabular}{lrrrr}\toprule
-Model & PSNR & SSIM & LPIPS & End-to-end time \\\midrule
-\textbf{Trained at 1080p, 2M cap (final)} & \textbf{20.44} & \textbf{0.689} & \textbf{0.230} & \textbf{$\approx$ 119 min} \\
-Trained at 4K, 1.2M cap & 19.74 & 0.663 & 0.253 & $\approx$ 151 min \\
-Trained at 4K, 3M cap & 19.30 & 0.655 & 0.265 & -- \\\bottomrule
-\end{tabular}\end{table}
-Training at 4K was both slower and worse on new views. The larger images show finer detail, but
-still from the same 12 viewpoints, so the extra detail is mostly fitted to those views and does not
-carry over to new ones. A larger budget did not help: as at 1080p, 3 million Gaussians brought back
-floaters, and the 4K 3 million model fell to 18.3~dB at frame 650. The 4K settings were not tuned
-beyond doubling the pixel thresholds, so 4K might do better with its own tuning, but on this evidence
-the half-resolution working copy is the better choice on both speed and quality. The native-resolution
-renders do show that the static scene holds real 4K detail (Figure~\ref{fig:4kcrop}).
-\begin{figure}[H]\centering
-\includegraphics[width=\linewidth]{figures/4k_native_crop_f300_f650.jpg}
-\caption{A $1920\times1080$ crop of the native 4K render from test camera 13 at frames 300 (left) and
-650 (right). Crowd faces, the scoreboard and the court lettering are sharp; late in the game, players
-in the crowded play under the basket are ghosted. \textbf{Setup:} RTX PRO 6000; trained at
-$3840\times2160$ with a 1.2 million-Gaussian budget.}\label{fig:4kcrop}
-\end{figure}
-
-\subsection{Earlier development results}
-Table~\ref{tab:dev} records how the method improved during development on the RTX 3080, before the
-final PRO 6000 runs. These runs used a slightly different undistorted image size, so their numbers are
-close to, but not directly comparable with, Table~\ref{tab:final-quality}.
-\begin{table}[H]\centering
-\caption{Development history. \textbf{Setup:} all rows RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted); scores are averages over the 24 test cameras unless the last column says otherwise. Test frames are every tenth video frame, which are also keyframes.}\label{tab:dev}
-\begin{tabular}{lrrrr}\toprule
-Method & Full PSNR & Person PSNR & Person IoU & Measurement \\\midrule
-Global 3DGS baseline & 17.50 & -- & -- & frame-0 test \\
-Stage A canonical & 19.32 & 18.34 & 0.788 & frame-0 test \\
-Stage B v1 & 18.29 & 15.00 & 0.70$\rightarrow$0.30 & keyframe test mean \\
-Stage B v2 (old) & 18.87 & 19.62 & 0.71$\rightarrow$0.39 & keyframe test mean \\
-Focused refinement, frames 1--20 & 22.42 & 26.76 & 0.746 & training-view mean \\
-300-frame diagnostic & 20.07 & 22.44 & -- & test mean \\\bottomrule
-\end{tabular}\end{table}
-
-\begin{figure}[H]\centering
-\begin{minipage}[b]{.32\linewidth}\centering
-\includegraphics[width=\linewidth]{figures/view13_gt_f200.png}\\\small Ground truth, view 13, frame 200
-\end{minipage}\hfill
-\begin{minipage}[b]{.32\linewidth}\centering
-\includegraphics[width=\linewidth]{figures/view13_v2_f200.png}\\\small Earlier Stage B v2
-\end{minipage}\hfill
-\begin{minipage}[b]{.32\linewidth}\centering
-\includegraphics[width=\linewidth]{figures/view13_courtflow_f200.png}\\\small CourtFlow-GS diagnostic
-\end{minipage}
-\caption{The same test camera (view 13) at frame 200 during development. \textbf{Setup:} RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted).}
-\end{figure}
-
-\subsection{Why these design choices were selected}
-The method was not chosen by adding complexity for its own sake. Table~\ref{tab:choices} records
-the practical failures we observed and the smallest change that addressed each one. These are useful
-trade-offs: some choices improve quality and speed at the same time by avoiding work on irrelevant
-pixels, while others deliberately spend more computation only where player detail needs it.
-\begin{table}[H]\centering
-\caption{Design choices and the observation behind each one. \textbf{Setup:} observations from development runs on the RTX 3080 (12 GB); training images $1874\times1054$ and test images $1879\times1055$ (the 4K capture halved, then undistorted); the last row comes from the final RTX PRO 6000 runs at $1920\times1080$.}\label{tab:choices}
-\small\begin{tabular}{p{.31\linewidth}p{.61\linewidth}}\toprule
-Choice & Why it was selected \\\midrule
-3D-first identities & Matching 2D centres and colours independently fragmented 68 masks into 60 apparent people. Building rough 3D components first gives the same player one ID across cameras. \\
-Occlusion-aware hull & A strict silhouette intersection removed hidden limbs. Allowing arbitrary misses inflated a hull by about $2.5\times$. Measured nearer depth supplies the middle ground. \\
-Masked MASt3R crops & Full-frame descriptors reduce a small player to about $6\times25$ pixels and produced star-shaped rays. Crops spend the fixed descriptor resolution on the player instead of the court. \\
-Same-group MLS controls & A global control graph lets nearby teammates pull each other. Fixed same-player control neighbours keep motions separate and also make deformation cheap. \\
-Shared translation plus local offsets & Moving every control alone reached 0.60 IoU by frame 10; shared translation plus local articulation reached 0.71 IoU. \\
-Crop refinement plus keyframes & Full-image updates mostly optimize static court pixels. Player crops improve moving detail cheaply; full keyframes occasionally correct accumulated error and add splats. \\
-Growth cap (found on the PRO 6000) & Uncapped keyframe growth compounded to 6.86M Gaussians and 16.1~dB by frame 699. Capping the total at 2 million Gaussians ended at 19.6~dB, was faster, and scored best of the budgets tried (1.1M, 2M, 3M). \\\bottomrule
-\end{tabular}\end{table}
-
-\subsection{Evaluation protocol and deliverables}
-The 12 training cameras are never used to judge quality. At every tenth frame and at the last frame,
-the tracker renders all 24 test cameras and compares them with the real images from those cameras.
-Nothing about the method was tuned on the test cameras except the growth cap, which was chosen from a
-short 300-frame comparison; its effect on the full video is reported above.
-
-The run writes two animated videos while it tracks: a test-camera video (view 13) and a camera that
-orbits the court. Each video frame is drawn from the scene exactly as it was at that moment of the
-game. The final results folder also keeps the editable frame-0 scene (79~MB), the control-point paths
-for all 700 frames (113~MB), and the final scene state (208~MB, 2.0 million Gaussians). A single
-saved state is one instant of the game, not the whole video: storing every frame naively would take
-about $700\times208$~MB $\approx$ 146~GB, so a practical package would store the frame-0 scene plus the
-per-frame motion in compressed form.
-
-\section{Runtime}
-\subsection{The full 700-frame run}
-Table~\ref{tab:e2e} shows where the time goes in one complete run of the final method on the RTX PRO
-6000, from the raw videos to finished novel-view videos.
-\begin{table}[H]\centering
-\caption{End-to-end time for the final method. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. The tracking row is
-the final run with the 2 million cap; the steps before it do not depend on the cap and were
-measured in the first 700-frame run.}\label{tab:e2e}
-\small\begin{tabular}{lr}\toprule
-Step & Wall-clock time \\\midrule
-Prepare input (undistort frame 0) & 0.3 min \\
-Stage A: build and score the frame-0 scene & 9.9 min \\
-Decode 700 frames from 36 videos & 11.2 min \\
-SAM2 player masks, 12 cameras one after another & 31.2 min \\
-Track the ball & 10.7 min \\
-Track players and refine, 700 frames (incl.\ test scoring and videos) & 55.3 min \\\midrule
-\textbf{Total} & \textbf{$\approx$ 119 min} \\\bottomrule
-\end{tabular}\end{table}
-Tracking itself costs 4.27~s per video frame (0.23 frames per second): 1.48~s moving control points,
-1.37~s refining player crops on nine frames out of ten, 8.13~s for each tenth-frame keyframe, and
-0.75~s (averaged) for masks and identity repair. For a few minutes this run shared the GPU with a
-scoring job, so these times are slightly pessimistic. Peak GPU memory was 7.2~GB with the 1.1 million
-cap and 12.1~GB with no cap; the 2 million run was not measured on its own. Almost half of the time
-before tracking is spent on data preparation rather than reconstruction; Section~\ref{sec:4k} measures
-the faster data path (JPEG frames, GPU undistortion, and SAM2 on four cameras at once) used for the
-4K run.
-
-\paragraph{Novel-view rendering (inference).} Drawing a tracked frame from a new camera takes about
-3.0~ms at 1080p and 3.8~ms at 4K for the final 2 million-Gaussian scene on the RTX PRO 6000;
-Section~\ref{sec:inference} covers inference in detail.
-
-\subsection{RTX 3080 versus RTX PRO 6000}
-\begin{table}[H]\centering
-\caption{The same work on both GPUs. \textbf{Setup:}
-RTX 3080 (12 GB) with training images at $1874\times1054$ and tracking renders at $937\times527$;
-RTX PRO 6000 (96 GB) with training images at $1920\times1080$ and tracking renders at $960\times540$.
-The PRO 6000 handles 5\% more pixels, so its speed-ups are slightly understated. Both GPUs ran the
-same settings, including the 3D identity repair. The Stage A row is the whole frame-0 build. The
-Stage B rows average video frames 2--29 (28 frames, two keyframes) on both GPUs; frame 1 is left out
-because the 3080 spent 159~s compiling its CUDA code there, which the PRO 6000 does ahead of time.
-The raster row draws the \emph{same} saved 3080 scene (2.0 million Gaussians) on both GPUs at
-$937\times527$.}\label{tab:runtime}
-\small\begin{tabular}{lrrr}\toprule
-Component & RTX 3080 12 GB & RTX PRO 6000 & Speed-up \\\midrule
-Stage A frame-0 canonical build & 1896 s & 528 s & 3.6$\times$ \\
-MLS deformation/control optimization & 2.75 s/frame & 1.28 s/frame & 2.1$\times$ \\
-\quad of which fused MLS forward & 0.072 s/frame & 0.029 s/frame & 2.5$\times$ \\
-Focused crop refinement (100 iterations) & 3.04 s/non-keyframe & 0.92 s/non-keyframe & 3.3$\times$ \\
-500-step full keyframe & 23.02 s/keyframe & 5.75 s/keyframe & 4.0$\times$ \\
-Mask refresh with identity repair, amortized & 1.83 s/frame & 1.02 s/frame & 1.8$\times$ \\
-Stage B total & 9.05 s/frame (0.110 FPS) & 3.57 s/frame (0.280 FPS) & 2.5$\times$ \\
-Colour + raster of a saved scene, 937$\times$527 & 4.36 ms (229 FPS) & 2.20 ms (455 FPS) & 2.0$\times$ \\\bottomrule
-\end{tabular}\end{table}
-
-The fused MLS/SVD calculation is only a small part of tracking time; drawing the Gaussians and
-computing gradients through that drawing dominate. The PRO 6000 gains most where the work is large:
-keyframes are $4.0\times$ faster and crop refinement $3.3\times$. Moving control points gains less
-($2.1\times$); each of its 50 steps draws only four small, half-resolution cameras, which likely
-leaves much of the larger GPU idle. Mask refresh gains least ($1.8\times$) because part of the
-identity repair runs on the CPU.
-
-\section{Inference: showing the reconstruction to a viewer}\label{sec:inference}
-Reconstruction (Stages A and B) is the slow, one-off part. Showing the result needs no training and
-none of the neural networks used earlier (SAM2, MASt3R, the person detector). To draw one moment of
-the game from any camera, only two steps run on the GPU:
-\begin{enumerate}
-\item \textbf{Bake} the moment: move every Gaussian to where it is at that frame. The control points
-store the motion; one fused CUDA kernel applies it (the same MLS step used during tracking).
-\item \textbf{Draw}: evaluate each Gaussian's colour for the viewing direction and rasterize (splat)
-the Gaussians into the image.
-\end{enumerate}
-
-\begin{table}[H]\centering
-\caption{Inference cost per frame. \textbf{Setup:} RTX PRO 6000 (96 GB), idle GPU, CUDA-synchronized
-timing averaged over 300 frames (drawing) or 20 repeats (baking); video encoding excluded.}\label{tab:inference}
-\small\begin{tabular}{lrr}\toprule
-Step & Scene & Time per frame \\\midrule
-Bake (move all Gaussians with 15{,}352 control points) & 2.0M Gaussians & 0.9--2.2 ms \\
-Draw at $1920\times1080$ & 1.10M Gaussians & 2.20 ms (455 FPS) \\
-Draw at $3840\times2160$ & 1.10M Gaussians & 2.94 ms (341 FPS) \\
-Draw at $1920\times1080$ & 2.0M Gaussians (final) & 2.96 ms (338 FPS) \\
-Draw at $3840\times2160$ & 2.0M Gaussians (final) & 3.82 ms (262 FPS) \\\bottomrule
-\end{tabular}\end{table}
-Baking plus drawing the final scene therefore takes about 4--6~ms, far faster than real time: the video itself
-runs at 25 frames per second (40~ms per frame).
-
-\subsection{What has to be stored}
+\section{Storage analysis}
 A saved scene is one instant of the game. To play the whole video, the simplest option is to store a
 full scene for every frame, but at 2 million Gaussians that is about 200~MB per frame in our current
 PLY format, or 140~GB for 700 frames. It is tempting to store the scene once and then only the
@@ -830,72 +974,6 @@ the following numbers are \emph{estimates} from those published ratios: roughly 
 background, under 1~MB per keyframe of players, and the control points, which is about
 10--35~Mbit/s depending on how well the control motion is compressed. That is the same range as a
 single 4K video stream.
-
-\subsection{Two ways to serve viewers}
-Delivering this to many people is closer to streaming a video game than to running a neural
-network, and the two standard game-streaming designs both apply.
-\paragraph{Render on the server (like cloud gaming).} The viewer sends where their virtual camera
-is; a server GPU bakes and draws that view, encodes it with the GPU's video encoder, and streams
-ordinary video back. Any device can watch, and the bandwidth is that of normal video. The costs are
-a network round trip whenever the viewer moves the camera (tens of milliseconds) and GPU time per
-viewer. Three things make this efficient at scale: bake each moment once and share it between all
-viewers watching that moment (baking is per game frame, drawing is per viewer); draw several
-viewers' cameras in one rasterizer call; and hand finished frames straight from GPU memory to the
-video encoder. Our current exporter instead copies every frame to the CPU and pipes it to ffmpeg,
-which is now its slowest step.
-\paragraph{Render on the viewer's device (like downloading game assets).} The server only sends
-the compressed package above, and the viewer's GPU bakes and draws. Camera moves are instant and
-server cost is little more than a content-delivery network, but the viewer needs a capable GPU:
-2 million Gaussians is heavy for a phone. The usual fix from games is level of detail: send fewer,
-larger Gaussians for distant or less important parts of the scene. A service would likely use both,
-with server rendering for weak devices and local rendering for strong ones.
-
-\subsection{Why ``just compile it'' does not work here}
-Tools such as TensorRT speed up neural networks by optimizing a fixed graph of large, regular
-operations (matrix multiplications, convolutions) whose sizes are known in advance. Gaussian
-splatting is not like that. Every frame it projects the Gaussians, sorts them by depth within each
-small screen tile, and blends them front to back, and how many Gaussians land in each tile changes
-with every camera and every moment of the game. The work is dominated by sorting and irregular
-memory access in custom CUDA kernels, which such compilers cannot express or improve. Speed-ups
-therefore come from engineering the renderer itself, as game engines do:
-\begin{itemize}
-\item \textbf{Fuse steps.} Baking is already a single kernel; folding the colour evaluation into it
-would remove another pass over all Gaussians.
-\item \textbf{Remove launch overhead} by recording the whole bake-and-draw sequence once as a CUDA
-graph and replaying it every frame.
-\item \textbf{Reuse work across frames.} Consecutive frames are nearly identical, so the previous
-depth order is an excellent starting point for the next sort.
-\item \textbf{Skip what is not visible}: drop Gaussians outside the camera's view before sorting,
-and use coarser detail far away.
-\item \textbf{Port the renderer} to Vulkan or WebGPU compute shaders so it runs in game engines and
-web browsers, where client-side viewing would happen.
-\end{itemize}
-
-\section{Can the method use fewer cameras?}
-We did not rebuild the full pipeline with fewer than 12 cameras, but two measurements indicate where
-the limit is. First, when one training camera was removed (leaving a $60^\circ$ gap), player PSNR
-seen from that gap fell from 18.3 to 17.0~dB, so a single wider gap already costs about 1.3~dB.
-Second, the method finds each player in 3D by asking at least four cameras to agree. With 12 cameras
-($30^\circ$ apart) most players are seen by enough cameras; with 6 ($60^\circ$ apart) many players
-would be seen well by only two or three, and identities would start to fail. Our estimate is that
-9 cameras ($40^\circ$ apart) is the practical minimum for this design, at a cost of roughly 1~dB,
-while 6 would need a stronger shape prior, for example a learned human body model, to replace the
-missing views.
-
-\section{Limitations and next steps}
-\begin{itemize}
-\item \textbf{Players in crowded plays.} Player tracking still degrades late in the video. The
-training-camera mask overlap falls from 0.52 at frame 100 to about 0.16 after frame 600, and the
-method needed 205 recoveries, where a lost player is reset from its frame-0 shape. Player PSNR drops
-from 24.30~dB in the first half to 21.78~dB in the second. The next step is to reduce these
-recoveries, for example by tracking players jointly when they overlap instead of one at a time.
-\item \textbf{A few thin floaters.} Some long, thin Gaussians near the cameras still show up as
-streaks in a few test views. Limiting how elongated a new Gaussian may become would target them.
-\item \textbf{Data preparation time.} Decoding and masking take almost as long as tracking at
-1080p. The faster data path used for 4K should be made the default at every resolution.
-\item \textbf{Storage.} A compact package (frame-0 scene plus compressed per-frame motion) is needed
-to ship the whole video instead of one state per frame.
-\end{itemize}
 
 \begin{thebibliography}{9}\small
 \bibitem{luiten2024dynamic} J.~Luiten, G.~Kopanas, B.~Leibe, D.~Ramanan. Dynamic 3D Gaussians: Tracking by Persistent Dynamic View Synthesis. 3DV 2024. \url{https://arxiv.org/abs/2308.09713}
