@@ -1,9 +1,9 @@
 \documentclass[11pt]{article}
 \usepackage[margin=0.9in]{geometry}
-\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref,algorithm,algpseudocode}
+\usepackage{graphicx,booktabs,amsmath,xcolor,float,hyperref,algorithm,algpseudocode,xspace}
 \usepackage{mathptmx} % Times New Roman-compatible text and mathematics
 \hypersetup{colorlinks=true,linkcolor=blue,urlcolor=blue}
-\newcommand{\method}{\textsc{CourtFlow-GS }}
+\newcommand{\method}{\textsc{CourtFlow-GS}\xspace}
 \newcommand{\pro}{\textcolor{red}{[measure on RTX PRO 6000]}}
 \title{\method: Online Multi-View Dynamic Gaussian Reconstruction with Fused MLS Tracking}
 \author{Shangar Muhunthan}
@@ -26,10 +26,82 @@ camera is. We train with every third camera (views $0,3,\ldots,33$) and keep the
 cameras aside for an honest test from viewpoints the model did not see during training. The camera
 calibration is fixed throughout the method.
 
-The input adapter reads \texttt{cameras/view\_XXX.mp4} together with
-\texttt{calibration/cameras.txt} and \texttt{images.txt}. It creates an undistorted,
-half-resolution working copy for training. This preserves the camera geometry while making the
-many repeated training renders practical on the RTX 3080.
+The input adapter reads the 36 videos and the COLMAP calibration (\texttt{cameras.txt} and
+\texttt{images.txt}) and creates an undistorted working copy for training. By default this copy is
+half resolution ($1920\times1080$), which keeps the camera geometry while making the many repeated
+training renders cheap; the same pipeline also runs at the native $3840\times2160$.
+
+\section{Existing methods and the 12-view problem}\label{sec:related}
+\paragraph{What existing dynamic methods assume.}
+Recent dynamic Gaussian methods reconstruct multi-view video either one frame at a time
+(\emph{frame-stream}) or in short clips. Dynamic 3D Gaussians~\cite{luiten2024dynamic} gives every
+Gaussian its own position and rotation at every timestep and regularizes them with local-rigidity
+losses. 3DGStream~\cite{sun2024_3dgstream} learns a small neural transformation cache per frame;
+QUEEN~\cite{girish2024queen} learns quantized per-Gaussian attribute residuals per frame.
+ClipGStream~\cite{liang2026clipgstream} optimizes short clips with spatio-temporal fields and
+inherits anchors from clip to clip. SC-GS~\cite{huang2024scgs} is the closest in its motion model:
+sparse control points drive dense Gaussians, but their motion is predicted by a deformation MLP
+trained offline over the whole sequence.
+
+These methods are evaluated with many more cameras than this assignment allows
+(Table~\ref{tab:related}). The closest benchmark is ClipGStream's Long~360: a 36-camera 4K ring
+like ours, but trained on 32 cameras and tested on 4. Here we train on 12 and test on 24. With
+cameras $30^\circ$ apart, a small player seen by a few cameras is only weakly constrained.
+Per-Gaussian motion or per-Gaussian residuals then have enough freedom to fit the training images
+without being correct from new viewpoints.
+
+\begin{table}[H]\centering
+\caption{Published settings of related methods. Numbers are from the papers, on their own datasets
+and GPUs, so they show the regime each method was designed for, not a like-for-like comparison.}
+\label{tab:related}
+\small\begin{tabular}{p{.17\linewidth}p{.25\linewidth}p{.25\linewidth}p{.23\linewidth}}\toprule
+Method & Training cameras (benchmark) & Motion model & Reported training time \\\midrule
+Dynamic 3D Gaussians & 27 of 31 (Panoptic dome) & per-Gaussian 6-DOF per frame & 2 h for 150 frames, RTX 3090 \\
+3DGStream & 20 of 21 (N3DV); 13 of 14 (Meet Room) & neural transform cache per frame & 12 s/frame + 23 min first frame, RTX 3090 \\
+QUEEN & 20 of 21 (N3DV) & quantized per-Gaussian residuals & 6 s/frame, A100 \\
+ClipGStream & 32 of 36 (Long 360, 4K ring) & per-clip spatio-temporal fields & $\approx$0.5 h per sequence \\
+SC-GS & dense / monocular & control points + deformation MLP & offline, whole sequence \\
+\method (ours) & \textbf{12 of 36} (4K ring) & per-player control-point MLS & Table~\ref{tab:runtime} \\\bottomrule
+\end{tabular}\end{table}
+
+\paragraph{ClipGStream on this dataset.}
+Before \method, we ran ClipGStream on exactly this capture with the same 12 training cameras and 24
+held-out cameras (RTX 3080, $960\times540$, first 10-frame clip). Table~\ref{tab:clipgstream} shows
+the sparse-view failure directly: training-view PSNR is 26--28~dB, but held-out PSNR is only
+17.2--17.9~dB. Training longer made the model \emph{worse} on new views (17.88~dB after 6000
+iterations, 17.53~dB after 40000) while training-view PSNR rose. Its reference clip took 7.2~min and
+each following 10-frame clip took 132--143~s (about 13.5~s per frame on the 3080).
+\begin{table}[H]\centering
+\caption{ClipGStream on this capture (12 training, 24 held-out cameras, RTX 3080). Mean over the 24
+held-out cameras at $960\times540$.}\label{tab:clipgstream}
+\small\begin{tabular}{lrrrr}\toprule
+Run & Train PSNR & Held-out PSNR & Held-out SSIM & Held-out LPIPS \\\midrule
+6000 iterations & 25.96 & 17.88 & 0.543 & 0.308 \\
+40000 iterations & 28.22 & 17.53 & 0.522 & 0.320 \\
+40000 iterations, court-focused & -- & 17.22 & 0.498 & 0.342 \\
+Streamed sequence, first clip & -- & 17.93 & 0.546 & 0.306 \\\bottomrule
+\end{tabular}\end{table}
+
+\paragraph{How \method differs.}
+\method is designed around the sparse ring rather than adapted to it:
+\begin{itemize}
+\item \textbf{Few motion unknowns.} Players move through 1024 control points each, with one shared
+translation per player and an as-rigid-as-possible shape term, instead of free per-Gaussian motion.
+Twelve views can constrain a few thousand control offsets; they cannot constrain millions of
+independent Gaussian updates.
+\item \textbf{Geometry from masks and matching, not only photometry.} Sparse-view 3DGS overfits
+because colour alone admits many wrong geometries. \method seeds players from occlusion-aware hulls
+and masked MASt3R crop matches, and uses DropGaussian~\cite{park2025dropgaussian}-style
+regularization, so held-out views start from a plausible 3D shape.
+\item \textbf{Identity is solved in 3D.} Every player is its own motion group, so a teammate or the
+court cannot absorb another player's motion, and SAM2 identity swaps are repaired in 3D.
+\item \textbf{Static work is done once.} About 95\% of each image is static court and stands.
+Frame-stream methods re-fit that area every frame; \method freezes it after frame 0 and spends
+per-frame computation only on the moving players. This is the rare case where the same change
+improves both speed and quality: less compute, and no drift in the static scene.
+\end{itemize}
+The one-shot geometry work costs more at frame 0 (Stage A) than a plain 3DGS initialization, but it
+is paid once per scene; afterwards each frame costs a few seconds.
 
 \section{Methodology}
 Before doing anything else, every image is undistorted. This removes lens bending, so a straight
@@ -470,4 +542,13 @@ recovery when a repaired mask shows that a player was lost. The 300-frame repair
 that change removes the observed failure rather than merely moving it later in the sequence. Other
 useful work is a smaller or level-of-detail version of the 2.01M-Gaussian final state, unbiased
 inter-keyframe held-out evaluation, and direct GPU-to-NVENC video output.
+
+\begin{thebibliography}{9}\small
+\bibitem{luiten2024dynamic} J.~Luiten, G.~Kopanas, B.~Leibe, D.~Ramanan. Dynamic 3D Gaussians: Tracking by Persistent Dynamic View Synthesis. 3DV 2024. \url{https://arxiv.org/abs/2308.09713}
+\bibitem{sun2024_3dgstream} J.~Sun et al. 3DGStream: On-the-Fly Training of 3D Gaussians for Efficient Streaming of Photo-Realistic Free-Viewpoint Videos. CVPR 2024. \url{https://arxiv.org/abs/2403.01444}
+\bibitem{girish2024queen} S.~Girish et al. QUEEN: QUantized Efficient ENcoding of Dynamic Gaussians for Streaming Free-viewpoint Videos. NeurIPS 2024. \url{https://arxiv.org/abs/2412.04469}
+\bibitem{liang2026clipgstream} J.~Liang et al. ClipGStream: Clip-Stream Gaussian Splatting for Any Length and Any Motion Multi-View Dynamic Scene Reconstruction. CVPR 2026. \url{https://arxiv.org/abs/2604.13746}
+\bibitem{huang2024scgs} Y.-H.~Huang et al. SC-GS: Sparse-Controlled Gaussian Splatting for Editable Dynamic Scenes. CVPR 2024. \url{https://arxiv.org/abs/2312.14937}
+\bibitem{park2025dropgaussian} H.~Park, G.~Ryu, W.~Kim. DropGaussian: Structural Regularization for Sparse-view Gaussian Splatting. CVPR 2025. \url{https://arxiv.org/abs/2504.00773}
+\end{thebibliography}
 \end{document}
