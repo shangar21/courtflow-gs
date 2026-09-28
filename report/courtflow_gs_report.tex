@@ -32,76 +32,86 @@ half resolution ($1920\times1080$), which keeps the camera geometry while making
 training renders cheap; the same pipeline also runs at the native $3840\times2160$.
 
 \section{Existing methods and the 12-view problem}\label{sec:related}
-\paragraph{What existing dynamic methods assume.}
-Recent dynamic Gaussian methods reconstruct multi-view video either one frame at a time
-(\emph{frame-stream}) or in short clips. Dynamic 3D Gaussians~\cite{luiten2024dynamic} gives every
-Gaussian its own position and rotation at every timestep and regularizes them with local-rigidity
-losses. 3DGStream~\cite{sun2024_3dgstream} learns a small neural transformation cache per frame;
-QUEEN~\cite{girish2024queen} learns quantized per-Gaussian attribute residuals per frame.
-ClipGStream~\cite{liang2026clipgstream} optimizes short clips with spatio-temporal fields and
-inherits anchors from clip to clip. SC-GS~\cite{huang2024scgs} is the closest in its motion model:
-sparse control points drive dense Gaussians, but their motion is predicted by a deformation MLP
-trained offline over the whole sequence.
-
-These methods are evaluated with many more cameras than this assignment allows
-(Table~\ref{tab:related}). The closest benchmark is ClipGStream's Long~360: a 36-camera 4K ring
-like ours, but trained on 32 cameras and tested on 4. Here we train on 12 and test on 24. With
-cameras $30^\circ$ apart, a small player seen by a few cameras is only weakly constrained.
-Per-Gaussian motion or per-Gaussian residuals then have enough freedom to fit the training images
-without being correct from new viewpoints.
-
-\begin{table}[H]\centering
-\caption{Published settings of related methods. Numbers are from the papers, on their own datasets
-and GPUs, so they show the regime each method was designed for, not a like-for-like comparison.}
-\label{tab:related}
-\small\begin{tabular}{p{.17\linewidth}p{.25\linewidth}p{.25\linewidth}p{.23\linewidth}}\toprule
-Method & Training cameras (benchmark) & Motion model & Reported training time \\\midrule
-Dynamic 3D Gaussians & 27 of 31 (Panoptic dome) & per-Gaussian 6-DOF per frame & 2 h for 150 frames, RTX 3090 \\
-3DGStream & 20 of 21 (N3DV); 13 of 14 (Meet Room) & neural transform cache per frame & 12 s/frame + 23 min first frame, RTX 3090 \\
-QUEEN & 20 of 21 (N3DV) & quantized per-Gaussian residuals & 6 s/frame, A100 \\
-ClipGStream & 32 of 36 (Long 360, 4K ring) & per-clip spatio-temporal fields & $\approx$0.5 h per sequence \\
-SC-GS & dense / monocular & control points + deformation MLP & offline, whole sequence \\
-\method (ours) & \textbf{12 of 36} (4K ring) & per-player control-point MLS & Table~\ref{tab:runtime} \\\bottomrule
-\end{tabular}\end{table}
-
-\paragraph{ClipGStream on this dataset.}
-Before \method, we ran ClipGStream on exactly this capture with the same 12 training cameras and 24
-held-out cameras (RTX 3080, $960\times540$, first 10-frame clip). Table~\ref{tab:clipgstream} shows
-the sparse-view failure directly: training-view PSNR is 26--28~dB, but held-out PSNR is only
-17.2--17.9~dB. Training longer made the model \emph{worse} on new views (17.88~dB after 6000
-iterations, 17.53~dB after 40000) while training-view PSNR rose. Its reference clip took 7.2~min and
-each following 10-frame clip took 132--143~s (about 13.5~s per frame on the 3080).
-\begin{table}[H]\centering
-\caption{ClipGStream on this capture (12 training, 24 held-out cameras, RTX 3080). Mean over the 24
-held-out cameras at $960\times540$.}\label{tab:clipgstream}
-\small\begin{tabular}{lrrrr}\toprule
-Run & Train PSNR & Held-out PSNR & Held-out SSIM & Held-out LPIPS \\\midrule
-6000 iterations & 25.96 & 17.88 & 0.543 & 0.308 \\
-40000 iterations & 28.22 & 17.53 & 0.522 & 0.320 \\
-40000 iterations, court-focused & -- & 17.22 & 0.498 & 0.342 \\
-Streamed sequence, first clip & -- & 17.93 & 0.546 & 0.306 \\\bottomrule
-\end{tabular}\end{table}
-
-\paragraph{How \method differs.}
-\method is designed around the sparse ring rather than adapted to it:
+\paragraph{How other methods handle moving scenes.}
+A Gaussian splatting scene is built from millions of small, coloured blobs called Gaussians. To show
+motion, a method has to decide how those blobs move from one video frame to the next. Most recent
+methods let every blob move on its own:
 \begin{itemize}
-\item \textbf{Few motion unknowns.} Players move through 1024 control points each, with one shared
-translation per player and an as-rigid-as-possible shape term, instead of free per-Gaussian motion.
-Twelve views can constrain a few thousand control offsets; they cannot constrain millions of
-independent Gaussian updates.
-\item \textbf{Geometry from masks and matching, not only photometry.} Sparse-view 3DGS overfits
-because colour alone admits many wrong geometries. \method seeds players from occlusion-aware hulls
-and masked MASt3R crop matches, and uses DropGaussian~\cite{park2025dropgaussian}-style
-regularization, so held-out views start from a plausible 3D shape.
-\item \textbf{Identity is solved in 3D.} Every player is its own motion group, so a teammate or the
-court cannot absorb another player's motion, and SAM2 identity swaps are repaired in 3D.
-\item \textbf{Static work is done once.} About 95\% of each image is static court and stands.
-Frame-stream methods re-fit that area every frame; \method freezes it after frame 0 and spends
-per-frame computation only on the moving players. This is the rare case where the same change
-improves both speed and quality: less compute, and no drift in the static scene.
+\item \textbf{Dynamic 3D Gaussians}~\cite{luiten2024dynamic} stores a new position and rotation for
+every blob at every frame, with a penalty that keeps neighbouring blobs moving together.
+\item \textbf{3DGStream}~\cite{sun2024_3dgstream} trains a small neural network for each frame that
+says how every blob moves.
+\item \textbf{QUEEN}~\cite{girish2024queen} stores a compressed per-blob change for each frame.
+\item \textbf{ClipGStream}~\cite{liang2026clipgstream} splits the video into short clips and learns
+the motion of each clip together.
+\item \textbf{SC-GS}~\cite{huang2024scgs} is closest to our method: a few control points move the
+blobs. But it learns the motion with a neural network trained on the whole video at once, and it
+was built for dense or single-camera video.
 \end{itemize}
-The one-shot geometry work costs more at frame 0 (Stage A) than a plain 3DGS initialization, but it
-is paid once per scene; afterwards each frame costs a few seconds.
+
+All of these were tested with many more cameras than this assignment gives us
+(Table~\ref{tab:related}). The closest test is ClipGStream's ``Long 360'' scene: a ring of 36 4K
+cameras, just like ours, but it trains on 32 of them. We may train on only 12. With 12 cameras,
+neighbouring cameras are $30^\circ$ apart, and a distant player may be clearly visible in only a
+few of them. When every blob can move freely, the method can match those few images exactly while
+putting blobs in the wrong 3D place. The result looks right from the training cameras and wrong
+from any new camera.
+
+\begin{table}[H]\centering
+\caption{The settings each method was published with. Numbers come from the papers, which use
+different datasets and GPUs, so this shows what each method was built for; it is not a direct
+speed or quality comparison.}\label{tab:related}
+\small\begin{tabular}{p{.17\linewidth}p{.25\linewidth}p{.25\linewidth}p{.23\linewidth}}\toprule
+Method & Training cameras & How blobs move & Reported training time \\\midrule
+Dynamic 3D Gaussians & 27 of 31 (dome) & each blob, every frame & 2 h for 150 frames (RTX 3090) \\
+3DGStream & 20 of 21, or 13 of 14 & small network per frame & 12 s per frame, plus 23 min for the first frame (RTX 3090) \\
+QUEEN & 20 of 21 & compressed change per blob & 6 s per frame (A100) \\
+ClipGStream & 32 of 36 (4K ring) & learned per short clip & about 30 min per video \\
+SC-GS & dense or one camera & control points + network & trained on the whole video \\
+\method (ours) & \textbf{12 of 36} (4K ring) & control points per player & Table~\ref{tab:runtime} \\\bottomrule
+\end{tabular}\end{table}
+
+\paragraph{We tried ClipGStream on this exact data.}
+Before building \method, we ran ClipGStream on this capture with the same 12 training cameras and
+the same 24 test cameras (on an RTX 3080, at $960\times540$, on the first 10 frames).
+Table~\ref{tab:clipgstream} shows the problem described above. On the training cameras it scored
+26--28~dB PSNR (higher is better), but on the 24 test cameras only 17.2--17.9~dB. Training for
+longer made the test score \emph{worse} (17.88~dB after 6000 steps, 17.53~dB after 40000) even
+though the training score went up: the model was memorizing the 12 views rather than learning the
+3D scene. It also took about 13.5~s per frame on the 3080, after a 7.2~minute start-up.
+\begin{table}[H]\centering
+\caption{ClipGStream on this capture: 12 training cameras, averaged over the 24 test cameras
+(RTX 3080, $960\times540$). PSNR and SSIM: higher is better. LPIPS: lower is better.}\label{tab:clipgstream}
+\small\begin{tabular}{lrrrr}\toprule
+Run & Training PSNR & Test PSNR & Test SSIM & Test LPIPS \\\midrule
+6000 steps & 25.96 & 17.88 & 0.543 & 0.308 \\
+40000 steps & 28.22 & 17.53 & 0.522 & 0.320 \\
+40000 steps, focused on the court & -- & 17.22 & 0.498 & 0.342 \\
+Full video run, first clip & -- & 17.93 & 0.546 & 0.306 \\\bottomrule
+\end{tabular}\end{table}
+
+\paragraph{What \method does differently.}
+\method was designed for few cameras from the start:
+\begin{itemize}
+\item \textbf{Far fewer things to solve for.} A player's blobs cannot move freely. They follow 1024
+control points, and each player first moves as a whole, then adds small movements for arms and
+legs, while keeping its shape. Twelve cameras are enough to pin down a few thousand control points;
+they are not enough to pin down millions of free blobs.
+\item \textbf{Shape comes from more than colour.} With few cameras, many wrong 3D shapes can produce
+the right colours. \method first builds each player's rough 3D shape from where the player appears
+in every camera (the ``visual hull'') and from matched points between cameras. It also randomly
+hides blobs during training (DropGaussian~\cite{park2025dropgaussian}) so no single blob can
+memorize one view.
+\item \textbf{Each player is kept separate.} Every player has their own control points, so one
+player can never drag a teammate or the floor along. When the automatic masks mix two players up,
+the mistake is fixed by checking which player is where in 3D.
+\item \textbf{The still parts are done once.} Players cover only about 4\% of each image; the rest is
+court and crowd that never moves. Other methods re-fit that area every frame. \method builds it
+once at frame 0 and afterwards only updates the players. This makes it both faster (less work per
+frame) and better (the court cannot slowly drift out of place).
+\end{itemize}
+The catch is a slower start: building the first frame carefully (Stage A) takes longer than a plain
+3D Gaussian start. But that happens once per scene; after it, each frame takes a few seconds.
 
 \section{Methodology}
 Before doing anything else, every image is undistorted. This removes lens bending, so a straight
