@@ -608,11 +608,8 @@ before tracking is spent on data preparation rather than reconstruction; Section
 the faster data path (JPEG frames, GPU undistortion, and SAM2 on four cameras at once) used for the
 4K run.
 
-\paragraph{Novel-view rendering (inference).} Once a frame has been tracked, drawing it from any new
-camera needs no training. On the RTX PRO 6000, the final 1080p scene (1.10 million Gaussians) renders
-at \textcolor{red}{[measured after the 4K run]} per frame at $1920\times1080$ and
-\textcolor{red}{[measured after the 4K run]} at $3840\times2160$ (colour evaluation plus
-rasterization; video encoding excluded).
+\paragraph{Novel-view rendering (inference).} Drawing a tracked frame from a new camera takes about
+2--3~ms on the RTX PRO 6000, even at 4K; Section~\ref{sec:inference} covers inference in detail.
 
 \subsection{RTX 3080 versus RTX PRO 6000}
 \begin{table}[H]\centering
@@ -643,6 +640,101 @@ keyframes are $4.0\times$ faster and crop refinement $3.3\times$. Moving control
 ($2.1\times$); each of its 50 steps draws only four small, half-resolution cameras, which likely
 leaves much of the larger GPU idle. Mask refresh gains least ($1.8\times$) because part of the
 identity repair runs on the CPU.
+
+\section{Inference: showing the reconstruction to a viewer}\label{sec:inference}
+Reconstruction (Stages A and B) is the slow, one-off part. Showing the result needs no training and
+none of the neural networks used earlier (SAM2, MASt3R, the person detector). To draw one moment of
+the game from any camera, only two steps run on the GPU:
+\begin{enumerate}
+\item \textbf{Bake} the moment: move every Gaussian to where it is at that frame. The control points
+store the motion; one fused CUDA kernel applies it (the same MLS step used during tracking).
+\item \textbf{Draw}: evaluate each Gaussian's colour for the viewing direction and rasterize (splat)
+the Gaussians into the image.
+\end{enumerate}
+
+\begin{table}[H]\centering
+\caption{Inference cost per frame. \textbf{Setup:} RTX PRO 6000 (96 GB), idle GPU, CUDA-synchronized
+timing averaged over 300 frames (drawing) or 20 repeats (baking); video encoding excluded.}\label{tab:inference}
+\small\begin{tabular}{lrr}\toprule
+Step & Scene & Time per frame \\\midrule
+Bake (move all Gaussians with 15{,}352 control points) & 2.0M Gaussians & 0.9--2.2 ms \\
+Draw at $1920\times1080$ & 1.10M Gaussians & 2.20 ms (455 FPS) \\
+Draw at $3840\times2160$ & 1.10M Gaussians & 2.94 ms (341 FPS) \\
+Draw at $1920\times1080$ and $3840\times2160$ & 2.0M Gaussians & \textcolor{red}{[pending]} \\\bottomrule
+\end{tabular}\end{table}
+Baking plus drawing therefore takes about 3--5~ms, which is well above real time: the video itself
+runs at 25 frames per second (40~ms per frame).
+
+\subsection{What has to be stored}
+A saved scene is one instant of the game. To play the whole video, the simplest option is to store a
+full scene for every frame, but at 2 million Gaussians that is about 200~MB per frame in our current
+PLY format, or 140~GB for 700 frames. It is tempting to store the scene once and then only the
+control-point positions for each frame, because the control points carry the motion. We tested this
+directly: starting from the saved scene at frame 600 and moving it with the stored control points,
+every player lands within 0.013 scene units of where the full run placed it at frame 650 (players had
+moved up to 11 units). The motion is therefore captured almost exactly. The picture is not: the full
+run also updates colours and adds detail at every keyframe and refines players every frame, and
+without those updates the test-camera PSNR is 0.6~dB lower after 10 frames and 1.4~dB lower after 50.
+
+A faithful and compact package therefore stores three things:
+\begin{itemize}
+\item the background once, plus the few background changes made at keyframes;
+\item the players' Gaussians at every keyframe (every 10 frames; about 193{,}000 Gaussians, under
+10\% of the scene);
+\item the control-point positions for every frame (15{,}352 points, about 92~kB per frame at
+half precision), which move the players between keyframes.
+\end{itemize}
+The Gaussians themselves can be made much smaller. Our PLY files spend about 104 bytes per Gaussian
+on full-precision numbers and unused fields. Half precision alone halves that. Vector quantization
+goes further: instead of storing every Gaussian's scale, rotation and colour, it stores a small
+``codebook'' of typical values and, per Gaussian, the index of the closest one. Published methods for
+static scenes report 15--50$\times$ smaller files at almost the same quality
+(LightGaussian~\cite{fan2024lightgaussian}, CompGS~\cite{navaneet2024compgs}); QUEEN applies the same
+idea to per-frame changes in video~\cite{girish2024queen}. We have not yet compressed our scenes, so
+the following numbers are \emph{estimates} from those published ratios: roughly 5--10~MB for the
+background, under 1~MB per keyframe of players, and the control points, which is about
+10--35~Mbit/s depending on how well the control motion is compressed. That is the same range as a
+single 4K video stream.
+
+\subsection{Two ways to serve viewers}
+Delivering this to many people is closer to streaming a video game than to running a neural
+network, and the two standard game-streaming designs both apply.
+\paragraph{Render on the server (like cloud gaming).} The viewer sends where their virtual camera
+is; a server GPU bakes and draws that view, encodes it with the GPU's video encoder, and streams
+ordinary video back. Any device can watch, and the bandwidth is that of normal video. The costs are
+a network round trip whenever the viewer moves the camera (tens of milliseconds) and GPU time per
+viewer. Three things make this efficient at scale: bake each moment once and share it between all
+viewers watching that moment (baking is per game frame, drawing is per viewer); draw several
+viewers' cameras in one rasterizer call; and hand finished frames straight from GPU memory to the
+video encoder. Our current exporter instead copies every frame to the CPU and pipes it to ffmpeg,
+which is now its slowest step.
+\paragraph{Render on the viewer's device (like downloading game assets).} The server only sends
+the compressed package above, and the viewer's GPU bakes and draws. Camera moves are instant and
+server cost is little more than a content-delivery network, but the viewer needs a capable GPU:
+2 million Gaussians is heavy for a phone. The usual fix from games is level of detail: send fewer,
+larger Gaussians for distant or less important parts of the scene. A service would likely use both,
+with server rendering for weak devices and local rendering for strong ones.
+
+\subsection{Why ``just compile it'' does not work here}
+Tools such as TensorRT speed up neural networks by optimizing a fixed graph of large, regular
+operations (matrix multiplications, convolutions) whose sizes are known in advance. Gaussian
+splatting is not like that. Every frame it projects the Gaussians, sorts them by depth within each
+small screen tile, and blends them front to back, and how many Gaussians land in each tile changes
+with every camera and every moment of the game. The work is dominated by sorting and irregular
+memory access in custom CUDA kernels, which such compilers cannot express or improve. Speed-ups
+therefore come from engineering the renderer itself, as game engines do:
+\begin{itemize}
+\item \textbf{Fuse steps.} Baking is already a single kernel; folding the colour evaluation into it
+would remove another pass over all Gaussians.
+\item \textbf{Remove launch overhead} by recording the whole bake-and-draw sequence once as a CUDA
+graph and replaying it every frame.
+\item \textbf{Reuse work across frames.} Consecutive frames are nearly identical, so the previous
+depth order is an excellent starting point for the next sort.
+\item \textbf{Skip what is not visible}: drop Gaussians outside the camera's view before sorting,
+and use coarser detail far away.
+\item \textbf{Port the renderer} to Vulkan or WebGPU compute shaders so it runs in game engines and
+web browsers, where client-side viewing would happen.
+\end{itemize}
 
 \section{Can the method use fewer cameras?}
 We did not rebuild the full pipeline with fewer than 12 cameras, but two measurements indicate where
@@ -677,5 +769,7 @@ to ship the whole video instead of one state per frame.
 \bibitem{liang2026clipgstream} J.~Liang et al. ClipGStream: Clip-Stream Gaussian Splatting for Any Length and Any Motion Multi-View Dynamic Scene Reconstruction. CVPR 2026. \url{https://arxiv.org/abs/2604.13746}
 \bibitem{huang2024scgs} Y.-H.~Huang et al. SC-GS: Sparse-Controlled Gaussian Splatting for Editable Dynamic Scenes. CVPR 2024. \url{https://arxiv.org/abs/2312.14937}
 \bibitem{park2025dropgaussian} H.~Park, G.~Ryu, W.~Kim. DropGaussian: Structural Regularization for Sparse-view Gaussian Splatting. CVPR 2025. \url{https://arxiv.org/abs/2504.00773}
+\bibitem{navaneet2024compgs} K.~L.~Navaneet et al. CompGS: Smaller and Faster Gaussian Splatting with Vector Quantization. ECCV 2024. \url{https://arxiv.org/abs/2311.18159}
+\bibitem{fan2024lightgaussian} Z.~Fan et al. LightGaussian: Unbounded 3D Gaussian Compression with 15x Reduction and 200+ FPS. NeurIPS 2024. \url{https://arxiv.org/abs/2311.17245}
 \end{thebibliography}
 \end{document}
