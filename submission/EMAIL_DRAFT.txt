@@ -1,0 +1,23 @@
+Subject: CourtFlow-GS reconstruction take-home submission
+
+Hello,
+
+Attached is my CourtFlow-GS submission for the reconstruction take-home assignment.
+
+The ZIP contains:
+- courtflow_gs_report.pdf — method, evaluation protocol, held-out metrics, runtime, limitations,
+  and the development/failure analysis;
+- videos/ — final novel-view renders from held-out cameras and an orbit, plus an uncapped comparison;
+- metrics/ — final-run summaries;
+- code/ — the complete source, including the forward-only CUDA playback command
+  `python -m ring_init.play --package <playback_dir> --camera view:13 --out view13.mp4`.
+
+The final reported result uses 12 of 36 cameras for training and evaluates only on the other 24
+cameras: 20.43 dB mean held-out PSNR over 700 frames at 1080p. It was trained on one RTX PRO 6000.
+
+The portable playback exporter is included in the source. A final model package is produced by
+running Stage B with `"v2_export_playback": true`; it is self-contained (calibration plus Gaussian
+parameters) and can be copied to another CUDA-capable machine without the dataset or training stack.
+
+Thank you,
+Shangar Muhunthan
