@@ -494,9 +494,27 @@ Tracking became faster (3.71 instead of 4.87~s per frame), peak GPU memory fell 
 the final model shrank from 714~MB to 114~MB, and the test PSNR over the whole video rose by
 0.85~dB. The cost is about 1~dB of player PSNR: with a fixed budget, players receive fewer new
 Gaussians for extra detail.
+
+\paragraph{How large should the budget be?} The 1.5$\times$ cap (1.1 million Gaussians) fixes the
+collapse but leaves players short of detail, so we also ran a cap of 2 million Gaussians
+(Figure~\ref{fig:drift}, green dotted line). It is better on every score (Table~\ref{tab:budget}):
+test PSNR over the whole video rises to 20.43~dB, players gain 0.27~dB, and the final frame ends at
+19.6~dB instead of 19.3~dB. It costs 15\% more tracking time (4.27 instead of 3.71~s per frame). The
+uncapped run still has the best player score, because its players keep receiving new Gaussians,
+but its background falls apart.
+\begin{table}[H]\centering
+\caption{Scene-size budget, whole video. \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Averages over the 69
+test frames (each the mean of the 24 test cameras).}\label{tab:budget}
+\small\begin{tabular}{lrrrrrr}\toprule
+Budget & Gaussians at end & PSNR & SSIM & LPIPS & Player PSNR & Tracking s/frame \\\midrule
+Uncapped & 6.86M & 19.34 & 0.675 & 0.243 & 23.70 & 4.87 \\
+1.5$\times$ frame 0 & 1.10M & 20.18 & 0.681 & 0.238 & 22.75 & 3.71 \\
+2 million & 2.00M & \textbf{20.43} & \textbf{0.689} & \textbf{0.230} & 23.02 & 4.27 \\
+3 million & \textcolor{red}{[running]} & & & & & \\\bottomrule
+\end{tabular}\end{table}
 \begin{figure}[H]\centering
 \includegraphics[width=.86\linewidth]{figures/growth_cap_drift.pdf}
-\caption{Test PSNR (top) and scene size (bottom) over the video, before and after the growth cap.
+\caption{Test PSNR (top) and scene size (bottom) over the video: no cap, a cap at 1.5 times the frame-0 size (1.1 million Gaussians), and a cap at 2 million Gaussians.
 \textbf{Setup:} RTX PRO 6000 (96 GB); training and test images at $1920\times1080$ (the 4K capture halved, then undistorted); all 700 frames. Each point is the average over the 24 test cameras.}\label{fig:drift}
 \end{figure}
 \begin{figure}[H]\centering
