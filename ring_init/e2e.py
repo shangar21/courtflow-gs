@@ -11,20 +11,29 @@ Example:
 """
 from __future__ import annotations
 import argparse
-import subprocess
-import sys
+import shutil
 from pathlib import Path
 
 from ring_init.config import Config
 from ring_init.run import stage_a, stage_b
 
 
-def _render(cfg_path: Path, scene: str, tag: str, checkpoint: int, camera: str, frames: str, out: Path) -> None:
-    out.parent.mkdir(parents=True, exist_ok=True)
-    command = [sys.executable, "-m", "ring_init.render_baked", "--scene", scene, "--config", str(cfg_path),
-               "--tag", tag, "--checkpoint", str(checkpoint), "--camera", camera, "--frames", frames,
-               "--fps", "25", "--scale", "0.5", "--out", str(out)]
-    subprocess.run(command, check=True)
+def _publish_animated_renders(run_root: Path, tag: str, eval_view: int) -> None:
+    """Publish videos rendered from each live per-frame state during Stage B.
+
+    A single baked PLY is a scene at one instant. Repeating the final PLY would make a
+    static video, so E2E publishes Stage B's per-frame held-out and orbit renders instead.
+    """
+    source = run_root / tag / "videos"
+    final = run_root / tag / "final_renders"; final.mkdir(parents=True, exist_ok=True)
+    inputs = {
+        source / f"heldout_view{eval_view:02d}.mp4": final / f"animated_eval_view{eval_view:02d}.mp4",
+        source / "orbit360.mp4": final / "animated_orbit360.mp4",
+    }
+    for src, dst in inputs.items():
+        if not src.is_file():
+            raise FileNotFoundError(f"Expected animated Stage-B render was not produced: {src}")
+        shutil.copy2(src, dst)
 
 
 def main() -> None:
@@ -35,10 +44,11 @@ def main() -> None:
     source.add_argument("--dataset-dir", help="raw capture root containing cameras/ and calibration/")
     ap.add_argument("--config", required=True, help="local JSON with camera/video/SAM2/evaluation paths")
     ap.add_argument("--out-dir", help="output root (default: <train-dir>/ring_dynamic_outputs)")
-    ap.add_argument("--frames", default="0:300", help="Stage-B frame range")
+    ap.add_argument("--frames", default="0:700", help="Stage-B frame range (the complete supplied 28-second sequence)")
     ap.add_argument("--force", default="", help="comma-separated Stage-A/B cache steps to recompute")
     ap.add_argument("--eval-view", type=int, default=13, help="held-out camera for final playback")
-    ap.add_argument("--orbit-frames", type=int, default=900, help="slow-orbit output length at 25 FPS")
+    ap.add_argument("--orbit-frames", type=int, default=0,
+                    help="deprecated; the final orbit is the animated Stage-B orbit over the requested frame range")
     ap.add_argument("--prepare-only", action="store_true", help="validate/bootstrap raw cameras+calibration, then stop before training")
     args = ap.parse_args()
 
@@ -53,6 +63,9 @@ def main() -> None:
     else:
         cfg.data_root = str(base)
     cfg.stage_b_mode = "scene"  # final QuickCapture-style MLS method; legacy v1 is never selected here.
+    # The final held-out video is rendered online during Stage B. Ensure the requested view is
+    # included even if a user changed the default diagnostic-video views in their local config.
+    cfg.v2_video_views = tuple(sorted(set(cfg.v2_video_views) | {args.eval_view}))
     force = {x for x in args.force.split(",") if x}
 
     # Persist the exact resolved run configuration with outputs, then use it for render commands.
@@ -65,13 +78,8 @@ def main() -> None:
     stage_a(args.scene, cfg, force, None, True)
     stage_b(args.scene, cfg, args.frames, force)
 
-    _, _, end_s = args.frames.partition(":"); final_frame = int(end_s) - 1
     tag = "stage_b_v2"  # ring_init.run's production scene tracker output.
-    render_dir = run_root / tag / "final_renders"
-    _render(resolved, args.scene, tag, final_frame, f"view:{args.eval_view}", args.frames,
-            render_dir / f"final_eval_view{args.eval_view:02d}.mp4")
-    _render(resolved, args.scene, tag, final_frame, "orbit", f"0:{args.orbit_frames}",
-            render_dir / "final_slow_orbit.mp4")
+    _publish_animated_renders(run_root, tag, args.eval_view)
     print(f"E2E run complete. Outputs: {run_root}")
 
 

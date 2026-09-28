@@ -132,7 +132,7 @@ class Config:
     reassoc_appearance_weight: float = 1.0
     reassoc_min_iou: float = 0.1
     reassoc_seed_margin_m: float = 0.3            # split merged components among people whose last position lies within
-    v2_mask_source: str = "reprompt"              # mask frames: reprompt (SAM2 prompted from tracked people; sweep "B") | video (SAM2 video labels) | reassoc (video labels + 3D identity repair)
+    v2_mask_source: str = "reassoc"               # mask frames: reprompt (SAM2 prompted from tracked people) | video (SAM2 video labels) | reassoc (video labels + 3D identity repair; production default)
     v2_mask_every: int = 5                        # 0: SAM2 video masks every frame; N: SAM2 re-prompted from tracked people every N frames
     v2_touchup_iterations: int = 5                # SH DC + opacity iterations between keyframes
     # Optional dense refinement experiment.  Unlike touch-up this optimizes the complete
@@ -157,7 +157,7 @@ class Config:
     v2_keyframe_full_every: int = 25              # ... with a full-frame keyframe every N frames
     v2_keyframe_focus_pad_px: int = 48
     v2_keyframe_protect: bool = True              # no opacity pruning at keyframes (lost players must not be deleted)
-    v2_health_iou: float = 0.0                    # keyframe re-init of persons with render-vs-mask IoU below this (0 = off; needs identity-repaired masks)
+    v2_health_iou: float = 0.10                   # keyframe re-init below this IoU; enabled only with identity-repaired masks
     v2_boost_iou: float = 0.5                     # persons below this IoU get a stronger anchor until the next keyframe
     v2_anchor_boost: float = 10.0
     v2_video_views: tuple[int, ...] = (13, 26)    # held-out source views rendered to video online

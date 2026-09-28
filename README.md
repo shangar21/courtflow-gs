@@ -59,16 +59,17 @@ baked PLY checkpoints under `<out_root>/<scene>/stage_b_v2/`.
 
 ## One-command E2E run
 
-`ring_init.e2e` is the release entry point.  It takes the training-data directory, runs canonical
-Stage A plus the selected Stage B method, evaluates held-out views, and generates a final
-held-out-view video and 36-second slow orbit from the final baked checkpoint.
+`ring_init.e2e` is the release entry point. It takes the training-data directory, runs canonical
+Stage A plus the selected Stage B method, evaluates held-out views, and publishes an animated
+held-out-view video and orbit rendered from the state at each video frame. A single baked
+checkpoint is one instant in time; it is not repeated as a misleading static ``final video.''
 
 For a raw capture root containing `cameras/view_000.mp4` … `view_035.mp4` and
 `calibration/cameras.txt` + `images.txt`:
 
 ```bash
 python -m ring_init.e2e --scene basketball --dataset-dir /datasets/basketball_capture \
-  --config ring_init/configs/config.example.json --out-dir /outputs/ring_final
+  --config ring_init/configs/config.example.json --out-dir /outputs/ring_final --frames 0:700
 ```
 
 The bootstrap adapter derives the 12 training cameras, all-view pinhole calibration, identity
@@ -80,8 +81,10 @@ paths before a real run. The command writes its fully resolved configuration to
 
 ## Baked inference
 
-Rendering a saved checkpoint does not run tracking, SAM2, MLS, or optimization.  It loads the
-state onto the GPU once and supports physical cameras or a rig-following orbit:
+Rendering a saved checkpoint does not run tracking, SAM2, MLS, or optimization. It loads one
+state (one instant of the reconstructed sequence) onto the GPU once and supports physical cameras
+or a rig-following orbit. For an animated result, use the per-frame held-out and orbit videos
+published by the E2E run:
 
 ```bash
 python -m ring_init.render_baked --scene basketball \
