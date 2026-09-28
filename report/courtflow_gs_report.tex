@@ -15,7 +15,7 @@
 \method turns synchronized videos from cameras around a basketball court into a 3D scene that can
 be viewed from a new camera angle. It first builds one clean, static ``starting scene'' from frame
 0. It then follows each player through the video by moving small sets of control points, and
-occasionally improves visual detail. The result is a 300-frame 3D reconstruction, novel-view
+occasionally improves visual detail. The result is a full 3D reconstruction, novel-view
 videos, and a saved Gaussian model that can be rendered later without retraining.
 \end{abstract}
 
@@ -85,7 +85,7 @@ The usual rule says to remove a voxel if even one camera does not see the player
 for a clean object on a turntable, but fails in basketball: another player, the hoop support, or
 padding can hide a real arm, leg, or head. We saw those missing body parts with a strict hull.
 
-The opposite rule, forgiving any missing view---was also bad. One allowed miss made player hulls
+The opposite rule (forgiving any missing view) was also bad. One allowed miss made player hulls
 about $2.5\times$ too large. Our compromise asks one simple question: \emph{is there measured
 evidence that something closer to this camera was blocking the player?} We forgive a missing pixel
 only when the answer is yes. This is what ``occlusion-aware'' means here.
@@ -133,7 +133,7 @@ halfway through training. We remove nearly transparent splats and splats that la
 expanded player mask in two cameras.
 
 \subsection{Group-aware control-point MLS}
-\paragraph{Why use separate control groups?}
+\paragraph{Control Groups}
 After frame 0, the task is to move the same Gaussian splats as players move. Rather than moving
 millions of splats independently, we place a much smaller set of control points on each player.
 Moving a control point moves nearby splats smoothly. This is called moving-least-squares (MLS)
@@ -157,7 +157,7 @@ where $\sigma_j$ is the average distance to control $j$'s three nearest controls
 same-group controls form the shape-preserving ARAP graph. In plain terms, a player's splats follow
 that player's nearby controls, never a teammate's or the court's.
 
-\paragraph{Why shared translation plus local motion?}
+\paragraph{Shared Translation + Local Motion}
 Trying to move every control independently made weakly observed controls lag or drift. By frame 10
 that version reached 0.60 mask overlap (IoU), compared with 0.71 when each player first gets one
 shared translation and then small local offsets. The shared translation handles running across the
@@ -248,6 +248,117 @@ and improve either player crops or a periodic full keyframe.
 \end{algorithmic}
 \end{algorithm}
 
+\section{Execution Walkthrough}
+The previous section explains \emph{why} each part of the method exists. This section follows one
+complete run from the raw capture to the final videos: which program runs, what it reads, what it
+writes, and where time is spent. Everything is started by a single command,
+\begin{verbatim}
+python -m ring_init.e2e --scene basketball --dataset-dir <capture> \
+    --config config.local.json --out-dir <out> --frames 0:700
+\end{verbatim}
+where the capture directory holds the 36 videos (\texttt{cameras/view\_XXX.mp4}) and the COLMAP
+calibration (\texttt{calibration/}). The local configuration only names the SAM2 checkpoint; all
+other settings are the defaults, and the exact resolved configuration is written to
+\texttt{e2e\_config.json} in the output directory before any work starts. Every step writes a completion
+marker (\texttt{done.json}) next to its output, so an interrupted run resumes where it stopped and
+\texttt{--force step} recomputes a single step. The times below were measured on the RTX PRO 6000.
+
+\subsection{Preparing the input (17 s)}
+The capture adapter reads the calibration for all 36 cameras, decodes frame 0 of every video with
+ffmpeg (Lanczos resampling from $3840\times2160$ to the $1920\times1080$ working resolution), and
+removes lens distortion with OpenCV so every camera becomes an ideal pinhole camera. Every third
+view is copied as the 12 training images \texttt{cam\_00}\ldots\texttt{cam\_11}; all 36 undistorted
+frame-0 images are kept for held-out evaluation. The adapter also writes the 12-camera and
+36-camera calibration files used by the rest of the pipeline.
+
+\subsection{Stage A: building the frame-0 scene ($\approx$9 min)}
+Stage A runs the steps of Table~\ref{tab:stage-a} in order. Each step caches its result on disk,
+and later steps only read those files, so the steps are independent programs joined by files.
+\begin{table}[H]\centering
+\caption{Stage A steps as executed, with RTX PRO 6000 wall-clock times.}\label{tab:stage-a}
+\small\begin{tabular}{p{.13\linewidth}p{.52\linewidth}p{.18\linewidth}r}\toprule
+Step & What runs & Writes & Time \\\midrule
+\texttt{calib} & Loads the 12 training cameras and images; draws the camera layout. & \texttt{calib/} & 2.1 s \\
+\texttt{match\_full} & MASt3R matches neighbouring ring cameras on whole frames (512 px). & 3D points & 33.4 s \\
+\texttt{floor} & RANSAC fits the court plane and its extent; fixes metric scale. & floor plane & 0.3 s \\
+\texttt{persons} & Faster R-CNN person boxes, then SAM2 masks, in every training camera. & per-camera masks & 11.7 s \\
+\texttt{instances} & Carves the court volume with all masks; 3D blobs become player IDs; re-prompts SAM2 for missing views. & label images $L_c$ & 16.7 s \\
+\texttt{hulls} & Occlusion-aware visual hull for every player. & voxel hulls & 4.3 s \\
+\texttt{match\_crops} & MASt3R on masked player crops for nearby camera pairs. & player points & 46.9 s \\
+\texttt{fuse} & Merges crop matches and hull fill into coloured seed clouds. & seed \texttt{.ply} & 5.6 s \\
+\texttt{train} & Optimizes each player's Gaussians, then the background with players composited in front. & Gaussian models & 406.9 s \\
+\texttt{export} & Copies the trained models into a canonical package with a manifest. & \texttt{canonical/} & $<$1 s \\
+\texttt{eval} & Renders frame 0 for all 24 held-out cameras and scores it. & \texttt{eval/} & -- \\\bottomrule
+\end{tabular}\end{table}
+Training is the only substantial cost. The detector, SAM2, and MASt3R networks are freed from GPU
+memory once their steps finish, so none of them competes with Gaussian training for memory.
+
+\subsection{Stage B, part 1: decoding the sequence}
+Before tracking starts, Stage B prepares all per-frame data. Six worker processes each stream one
+camera's video through ffmpeg and apply exactly the frame-0 preprocessing: the same resampling, the
+same precomputed undistortion map, and the same per-camera colour correction. The 12 training
+cameras are decoded at every frame (8400 images for 700 frames). The 24 held-out cameras are
+decoded only at every tenth frame, because they are used only for scoring. Frames are stored as
+lightly compressed PNG files, and already decoded frames are skipped on a rerun.
+
+SAM2 then runs once per training camera in video mode. It is prompted with that camera's frame-0
+player labels from Stage A and follows every player through the whole sequence. These raw masks
+are not trusted as they are: SAM2 treats each camera separately and can swap two players in one
+camera but not another. Identities are therefore repaired in 3D during tracking (below). Finally,
+the ball is detected and triangulated at frame 0, tracked causally through the sequence with a
+gravity and bounce model, and added to the canonical scene as its own small group of Gaussians.
+
+\subsection{Stage B, part 2: the per-frame loop}
+The canonical Gaussians are loaded onto the GPU once and stay there for the whole sequence. Control
+points are placed on every group (1024 per player, 16 on the ball, 1000 on the background), and each
+Gaussian is bound to its eight nearest same-group controls. Then, for every frame $f$:
+\begin{enumerate}
+\item \textbf{Load.} A background thread has already read frame $f$'s 12 training images from disk
+while the GPU was busy with frame $f-1$. The images are downsampled to the tracking resolution
+($960\times540$) and uploaded; the full-resolution copies are kept for refinement.
+\item \textbf{Masks and anchors (every fifth frame).} The SAM2 masks for frame $f$ are read, their
+identities are rebuilt in 3D exactly as in Stage A's \texttt{instances} step, and the repaired masks
+are matched to the tracked players by position and jersey colour. Triangulating each player's mask
+centre gives a motion anchor. On other frames, no masks or anchors are used.
+\item \textbf{Deform.} Fifty Adam iterations update each player's shared translation and local
+control offsets; the fused CUDA MLS operation moves the Gaussians. Background controls stay frozen,
+and the moving players are rendered over a cached background image.
+\item \textbf{Improve detail.} On nine frames out of ten, 100 iterations refine only the crops
+around moving players. Every tenth frame is a keyframe. First, a health check compares each
+player's rendered footprint with the repaired masks; a player whose overlap has fallen below
+0.10 IoU is re-initialized from its canonical shape at its anchor. Then 500 full-image iterations
+run with limited densification, the Gaussians are re-bound to their controls, and the background
+cache is refreshed.
+\item \textbf{Record.} The current state is rendered for held-out views 13 and 26 and for the orbit
+camera and streamed to ffmpeg, so each video frame shows the scene at that instant. Every tenth
+frame, and at the last frame, all 24 held-out cameras are rendered and scored (PSNR, SSIM, LPIPS,
+and player-region PSNR); the training views also report mask IoU. Every 25 frames, the full
+Gaussian state is saved as a PLY checkpoint and the control trajectories and metrics are flushed
+to disk.
+\end{enumerate}
+After the last frame, the final state is saved and per-stage timings and quality statistics are
+summarized in \texttt{summary.json}. The held-out view-13 video and the orbit video are then
+published to \texttt{final\_renders/} with an \texttt{animated\_} prefix, marking them as renders
+of the moving scene rather than of one baked checkpoint.
+
+\subsection{What the run leaves on disk}
+The output directory keeps every intermediate product, so any step can be inspected or rerun:
+{\small\begin{verbatim}
+<out>/prepared_input/basketball/   undistorted frame-0 images and calibration
+<out>/basketball/
+    e2e_config.json, timings.json  resolved settings and step times
+    persons/ instances/ hulls/ ... Stage A intermediate results
+    canonical/                     editable frame-0 Gaussian scene + manifest
+    eval/                          frame-0 held-out scores and images
+    frames/ eval_frames/           decoded training and held-out frames
+    video_masks/ ball/             SAM2 masks and the ball trajectory
+    stage_b_v2/
+        metrics.json summary.json  per-frame metrics and the run summary
+        control_positions.npz      control-point trajectories for all frames
+        ply/frame_NNNNNN/          Gaussian checkpoints every 25 frames
+        videos/ final_renders/     held-out and orbit videos
+\end{verbatim}}
+
 \section{Results}
 The final diagnostic reconstructs 300 frames. PSNR measures image similarity in decibels (higher is
 better); person PSNR measures it only on player regions; IoU measures how well predicted and true
@@ -312,28 +423,43 @@ kept for re-training or editing. The final source scene is about 150 MB on the R
 per-frame PLY bake would be about 42 GB for 300 frames, so a deployable animated package should use
 packed, quantized frame chunks rather than text PLY files.
 
-\section{RTX 3080 runtime}
+\section{Runtime}
 \begin{table}[H]\centering
-\caption{Runtime. A frame normally uses MLS, crop refinement, and occasionally the more expensive
-keyframe step.}\begin{tabular}{lrr}\toprule
-Component & RTX 3080 12 GB & RTX PRO 6000 \\\midrule
-MLS deformation/control optimization & 1.95 s/frame & \pro \\
-Focused crop refinement & 3.41 s/non-keyframe & \pro \\
-500-step full keyframe & 23.16 s/keyframe & \pro \\
-Mask refresh, amortized & 0.33 s/frame & \pro \\
-End-to-end diagnostic & 7.61 s/frame (0.131 FPS) & \pro \\
-GPU SH colour + baked raster, 937$\times$527 & 4.36 ms (229 FPS) & \pro \\\bottomrule
+\caption{Runtime on both GPUs (preliminary for the PRO 6000). Working resolution: RTX 3080
+1874$\times$1054 with tracking renders at 937$\times$527; RTX PRO 6000 1920$\times$1080 with
+tracking renders at 960$\times$540 (5\% more pixels, so the PRO 6000 speed-ups are slightly
+understated). Stage B rows are steady-state means over the same frames 2--29 (28 frames, two
+keyframes) with the identical production configuration, including 3D identity repair, on both
+GPUs. Frame 1 is excluded because the 3080 compiled its CUDA kernels there (159 s); the PRO 6000
+compiles them beforehand. The raster row renders a baked checkpoint at the stated
+resolution.}\label{tab:runtime}
+\small\begin{tabular}{lrrr}\toprule
+Component & RTX 3080 12 GB & RTX PRO 6000 & Speed-up \\\midrule
+Stage A frame-0 canonical build & 1896 s & 528 s & 3.6$\times$ \\
+MLS deformation/control optimization & 2.75 s/frame & 1.28 s/frame & 2.1$\times$ \\
+\quad of which fused MLS forward & 0.072 s/frame & 0.029 s/frame & 2.5$\times$ \\
+Focused crop refinement (100 iterations) & 3.04 s/non-keyframe & 0.92 s/non-keyframe & 3.3$\times$ \\
+500-step full keyframe & 23.02 s/keyframe & 5.75 s/keyframe & 4.0$\times$ \\
+Mask refresh with identity repair, amortized & 1.83 s/frame & 1.02 s/frame & 1.8$\times$ \\
+Stage B total & 9.05 s/frame (0.110 FPS) & 3.57 s/frame (0.280 FPS) & 2.5$\times$ \\
+GPU SH colour + baked raster, 937$\times$527 & 4.36 ms (229 FPS) & \pro & \\\bottomrule
 \end{tabular}\end{table}
 
 The fused MLS/SVD calculation is only a small part of tracking time. Rendering and differentiating
 through the rasterizer dominate optimization. Once motion is baked, GPU rendering is fast; the
 current video exporter is instead limited by copying frames from Python to ffmpeg.
 
-The frame-0 canonical build took 1896 s (31.6 min) on the RTX 3080, including geometry, crops,
-fusion, and Gaussian training. The 300-frame diagnostic's measured 7.61 s/frame corresponds to
-about 38.1 min for Stage B alone. These are 3080 reference measurements, not extrapolations to the
-PRO 6000. The complete 700-frame PRO 6000 run will replace the placeholders above with measured
-wall-clock time, peak VRAM, and inference time at stated 1080p and 4K resolutions.
+The PRO 6000 gains most where the work is large, dense Gaussian optimization: keyframes are
+$4.0\times$ faster and crop refinement $3.3\times$. Control-point optimization gains less
+($2.1\times$); each of its 50 iterations renders only four cropped, half-resolution cameras, a
+workload too small to occupy the larger GPU fully. Mask refresh gains least ($1.8\times$); part of
+the 3D identity repair (mask decoding, assignment, and relabelling) runs on the CPU, which the new
+GPU does not accelerate.
+
+These Stage B values describe the early part of the sequence. Later, crowded frames cost more: over
+all 300 frames of the same configuration the RTX 3080 averaged 10.54 s/frame, against 9.05 s/frame
+over frames 2--29. The complete 700-frame PRO 6000 run will replace these preliminary values with
+full-sequence averages, total wall-clock time, peak VRAM, and baked rendering time at 1080p and 4K.
 
 \section{Limitations and next steps}
 The main remaining weakness is identity tracking in crowded late-game plays. Independent SAM2 masks
